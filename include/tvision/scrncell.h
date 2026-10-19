@@ -31,19 +31,29 @@ struct TScreenCell
 
 inline TScreenCell& TScreenCell::operator=(const TScreenCell &other)
 {
-    (ushort &) *this = (const ushort &) other;
+    character = other.character;
+    attribute = other.attribute;
     return *this;
 }
 
+// The three operators above used to reach the two bytes by casting *this to a
+// ushort reference.  That spelling does not mean what it looks like: for a cast to
+// a reference type, an operand of class type is converted by the class's own
+// conversion function when it has one, so `(const ushort &) *this' inside
+// operator ushort() calls operator ushort() -- on every compiler that follows that
+// rule, which is to say everywhere except the one this file predates.  The cell is
+// two bytes with no padding, so saying it member by member is the same store, and
+// the low half is the character and the high half the attribute, as x86 laid it out.
 inline TScreenCell& TScreenCell::operator=(ushort value)
 {
-    (ushort &) *this = value;
+    character = (char) (value & 0xFF);
+    attribute = (TColorAttr) (value >> 8);
     return *this;
 }
 
 inline TScreenCell::operator ushort() const
 {
-    return (const ushort &) *this;
+    return (ushort) (((unsigned) (unsigned char) character) | ((unsigned) attribute << 8));
 }
 
 #else
