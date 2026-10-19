@@ -270,6 +270,6 @@ inline bool TScreenCell::operator!=(const TScreenCell &other) const
     return !(*this == other);
 }
 
-#endif // __BORLANDC__
+#endif // DOS text-mode cell
 
 #endif // TVISION_SCRNCELL_H

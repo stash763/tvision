@@ -523,6 +523,6 @@ inline Boolean TText::drawOneT( TSpan<TScreenCell> cells, size_t &i,
     return result.length != 0;
 }
 
-#endif // __BORLANDC__
+#endif // single-byte TText, for compilers without C++11
 
 #endif // Uses_TText

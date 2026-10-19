@@ -28,6 +28,13 @@ typedef uchar TColorAttr;
 
 typedef ushort TAttrPair;
 
+/* Tell code built against this library which model it got: there is no TColor,
+   no TColorRGB and no slBold..slUnderline below this line, only the attribute
+   byte above.  A consumer asks for TVISION_LEGACY_COLORS rather than repeating
+   the compiler query that selected this branch. */
+
+#define TVISION_LEGACY_COLORS
+
 #else
 
 /*-------------------------------------------------------------------------*/
@@ -855,6 +862,6 @@ constexpr TAttrPair TColorAttr::operator<<(int shift) const noexcept
     return uchar(*this) << shift;
 }
 
-#endif // __BORLANDC__
+#endif // legacy colour model, TVISION_LEGACY_COLORS
 
 #endif // TVISION_COLORS_H
