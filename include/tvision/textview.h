@@ -49,7 +49,13 @@ public:
 
 protected:
 
-#if !defined( __BORLANDC__ )
+#if !defined( __BORLANDC__ ) && __cplusplus >= 201103L
+    // The override below is only for the standard iostreams, where xsputn is the
+    // hook a streambuf subclass has to provide.  Open Watcom's library is not one
+    // of those: like Borland's, it is the pre-standard one, whose hook is
+    // do_sputn -- declared above, and still there in Watcom's <streambu>, which
+    // also has no std::streamsize at all.  So for both compilers this declaration
+    // is both wrong and unparseable.
     virtual std::streamsize xsputn(const char *s, std::streamsize count);
 #endif
 

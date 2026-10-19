@@ -78,7 +78,15 @@ public:
     static void setScreenMode( ushort mode ) noexcept;
     static void clearScreen( ushort w, ushort h ) noexcept;
     static void flushScreen() noexcept;
-#if defined( __BORLANDC__ )
+/* Two spellings of the same call, not two different calls: the legacy build hands
+   the driver an array of two-byte cells, which is what a CHAR_INFO is made of
+   (compat/windows/windows.h defines the type for every compiler that has no
+   windows.h, which is everybody except Borland and the Windows builds).  Open
+   Watcom takes the Borland spelling because that is the one the legacy path in
+   tvwrite.cpp writes -- it converts cells with copyShort2CharInfo and calls this
+   overload, and with the TScreenCell one instead the call fails with 'function
+   argument(s) do not match those in prototype'. */
+#if defined( __BORLANDC__ ) || defined( __WATCOMC__ )
     static void screenWrite( ushort x, ushort y, CHAR_INFO *buf, DWORD len ) noexcept;
 #else
     static void screenWrite( ushort x, ushort y, TScreenCell *buf, DWORD len ) noexcept;

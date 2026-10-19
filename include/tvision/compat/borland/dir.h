@@ -24,6 +24,13 @@
 #include <direct.h>
 #else
 #include <unistd.h>
+#if defined( __WATCOMC__ )
+/* chdir -- the one thing in here that <unistd.h> does not provide on OS/2.
+   Watcom declares it in <direct.h>; measured by compiling a call to chdir against
+   each candidate header: direct.h yes, unistd.h no, io.h no.  TChDirDialog calls
+   it, and fails with "symbol 'chdir' has not been declared" until this is here. */
+#include <direct.h>
+#endif
 #endif
 
 #include "_defs.h"
@@ -47,6 +54,48 @@ struct  ffblk   {
     unsigned short  ff_ftime;
     unsigned short  ff_fdate;
     char            ff_name[256];
+};
+#endif
+
+/* The file-attribute bits, which findfirst takes as its 'attrib' argument and
+   which the classic layer tests against ff_attrib (five files use FA_DIREC).
+   Borland's <dir.h> defines these next to struct ffblk, so an emulation of
+   <dir.h> that leaves them out is not a complete one; they were being picked up
+   from <dos.h> instead, which works until a compiler ships a dos.h of its own
+   that cannot be shadowed.  Open Watcom does: its dos.h is the 16-bit DOS one,
+   it defines no FA_ names, and D:\WATCOM\h is searched before any include path.
+   Measured by five files failing with "symbol 'FA_DIREC' has not been declared".
+   Same values as compat/borland/dos.h carries. */
+
+#ifndef FA_NORMAL
+#define FA_NORMAL   0x00        /* Normal file, no attributes */
+#define FA_RDONLY   0x01        /* Read only attribute */
+#define FA_HIDDEN   0x02        /* Hidden file */
+#define FA_SYSTEM   0x04        /* System file */
+#define FA_LABEL    0x08        /* Volume label */
+#define FA_DIREC    0x10        /* Directory */
+#define FA_ARCH     0x20        /* Archive */
+#endif
+
+/* The date and time a directory entry carries, packed into bit fields the way
+   Borland packs them: struct ffblk's ff_ftime and ff_fdate hold this, so does
+   TSearchRec's 'time' member, and stddlg.cpp unpacks it to print when a file was
+   last written.  compat/borland/io.h defines it, and that reaches every compiler
+   except one that ships an io.h of its own -- Open Watcom does, and nothing can
+   shadow it.  Measured: stddlg.cpp's 'struct ftime *' failed as 'attempt to use
+   pointer to undefined class'.  A type wanted by two headers, only one of which
+   is reachable everywhere, has to be guarded rather than copied, so the same
+   guard is in compat/borland/io.h and whichever header comes first defines it. */
+
+#ifndef TVISION_COMPAT_FTIME
+#define TVISION_COMPAT_FTIME
+struct  ftime   {
+  unsigned    ft_tsec  : 5;   /* Two second interval */
+  unsigned    ft_min   : 6;   /* Minutes */
+  unsigned    ft_hour  : 5;   /* Hours */
+  unsigned    ft_day   : 5;   /* Days */
+  unsigned    ft_month : 4;   /* Months */
+  unsigned    ft_year  : 7;   /* Year */
 };
 #endif
 

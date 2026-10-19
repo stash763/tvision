@@ -82,10 +82,16 @@ void TApplication::dosShell()
 {
     suspend();
     writeShellMsg();
-#if defined( __BORLANDC__ ) || defined( _WIN32 )
-    system( getenv( "COMSPEC" ) );
-#else
+/* Raising SIGTSTP hands the terminal to the shell through job control, and only
+   Unix has job control, so this is a question about the operating system and not
+   about the compiler -- which is what tv.h already spells as _TV_UNIX.  Nothing
+   changes for what this file has always known: Borland and Windows spawn
+   $COMSPEC, everything else raised the signal.  OS/2, which has a COMSPEC and no
+   SIGTSTP, now takes the branch that works for it. */
+#if defined( _TV_UNIX )
     raise( SIGTSTP );
+#else
+    system( getenv( "COMSPEC" ) );
 #endif
     resume();
     redraw();

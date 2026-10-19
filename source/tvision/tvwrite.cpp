@@ -43,7 +43,12 @@ struct TVWrite {
     void L30( TView * ) noexcept;
     void L40( TView * ) noexcept;
     void L50( TGroup * ) noexcept;
-#ifdef __BORLANDC__
+/* The branches in this file are the legacy cell model -- one character and one
+   attribute byte per cell -- as opposed to the TScreenCell/TColorAttr struct
+   model, so they follow the condition colors.h and scrncell.h pick the model by.
+   Borland as always, plus anything predating C++11, since the struct model is
+   built out of C++11 and cannot compile without it. */
+#if defined( __BORLANDC__ ) || __cplusplus < 201103L
     void copyShort( TScreenCell *, const TScreenCell * );
     void copyShort2CharInfo( CHAR_INFO *, const TScreenCell * );
 #else
@@ -60,7 +65,7 @@ struct TVWrite {
 
     static TColorAttr applyShadow(TColorAttr attr) noexcept
     {
-#ifdef __BORLANDC__
+#if defined( __BORLANDC__ ) || __cplusplus < 201103L
         // Because we can't know if the cell has already been shadowed,
         // we compare against the shadow attributes. This may yield some false positives.
         TColorAttr shadowAttrInv = (shadowAttr << 4) | (shadowAttr >> 4);
@@ -92,7 +97,7 @@ void TView::writeView( short x, short y, short count, const void _FAR* b ) noexc
     TVWrite().L0(this, x, y, count, b);
 }
 
-#ifndef __BORLANDC__
+#if !defined( __BORLANDC__ ) && __cplusplus >= 201103L
 void TView::writeView( short x, short y, short count, const TScreenCell* b ) noexcept
 {
     TVWrite(false).L0(this, x, y, count, b);
@@ -219,7 +224,7 @@ void TVWrite::L40( TView *dest ) noexcept
 
 void TVWrite::L50( TGroup *owner ) noexcept
 {
-#ifdef __BORLANDC__
+#if defined( __BORLANDC__ ) || __cplusplus < 201103L
     const TScreenCell *src = &((const TScreenCell *) Buffer)[X - wOffset];
     if (owner->buffer != TScreen::screenBuffer)
     {
@@ -249,7 +254,7 @@ void TVWrite::L50( TGroup *owner ) noexcept
 #endif // __BORLANDC__
 }
 
-#ifdef __BORLANDC__
+#if defined( __BORLANDC__ ) || __cplusplus < 201103L
 // On Windows and DOS, Turbo Vision stores a byte of text and a byte of
 // attributes for every cell. On Windows, all TGroup buffers follow this schema
 // except the topmost one, which interfaces with the Win32 Console API.
@@ -363,7 +368,7 @@ void TView::writeLine( short x, short y, short w, short h, const void _FAR *b ) 
     }
 }
 
-#ifndef __BORLANDC__
+#if !defined( __BORLANDC__ ) && __cplusplus >= 201103L
 void TView::writeLine( short x, short y, short w, short h, const TScreenCell *b ) noexcept
 {
     while (h-- > 0)

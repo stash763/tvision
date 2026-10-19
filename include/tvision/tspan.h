@@ -50,7 +50,11 @@ public:
     {
     }
 
-#if !defined(__BORLANDC__)
+#if !defined(__BORLANDC__) && __cplusplus >= 201103L
+    // Both constructors below are C++11: the first names `nullptr`, the second
+    // delegates to another constructor of the same class from its
+    // mem-initializer.  Borland has never had them; every other compiler
+    // predating C++11 does not either, which is what the dialect test adds.
     constexpr TSpan(decltype(nullptr)) noexcept :
         TSpan()
     {

@@ -107,7 +107,21 @@ int snprintf( char _FAR *buffer, size_t size, const char _FAR *format, ... );
 int vsnprintf( char _FAR *buffer, size_t size, const char _FAR *format,
                void _FAR *arglist );
 
-#elif !defined( _WIN32 )
+#elif !defined( _WIN32 ) && !defined( __WATCOMC__ )
+
+/* Open Watcom is excluded along with Windows.  The two branches above this one
+   cover what a RTL is missing: Borland has no snprintf, Unix has no DOS-named
+   string and conversion helpers.  Watcom's RTL is the DOS one and has all eight
+   of them, which was checked rather than assumed -- probe programs kept with
+   the OS/2 port of this library call stricmp/strnicmp/strupr/strlwr/itoa/ltoa/
+   ultoa, and snprintf/vsnprintf, and link.  It matters in both directions:
+   declaring one the RTL already has collides with its `watcall` declaration
+   (E619 "linkage specification is different than previous declaration", reported
+   from inside Watcom's own <cstring> with a note pointing here), and not
+   declaring one it lacks is an undeclared function.  The old-compiler build
+   compiles source/tvision only, so it does not reach the definitions of these
+   names further down source/platform/strings.cpp; if that build ever grows the
+   file, the definitions need the same exclusion this declaration has. */
 
 int stricmp( const char *s1, const char *s2 ) noexcept;
 int strnicmp( const char *s1, const char *s2, size_t maxlen ) noexcept;

@@ -33,7 +33,12 @@ const int maxReplaceStrLen = 80;
 
 const int minPasteEventCount = 3;
 
-#if !defined( __BORLANDC__ )
+/* UTF-8 is the modern build's business; the legacy build -- the one the legacy
+   colour model above implies -- is single-byte throughout.  The condition is the
+   dialect test ttypes.h uses for the same purpose, and it covers Borland as it
+   always did: with maxCharSize 1, TScreenCharacter's storage is sized for what
+   the build can actually decode. */
+#if !defined( __BORLANDC__ ) && __cplusplus >= 201103L
 const int maxCharSize = 4; // A UTF-8-encoded character is up to 4 bytes long.
 #else
 const int maxCharSize = 1; // All characters are single-byte-encoded.

@@ -27,6 +27,13 @@
 #include <dos.h>
 #endif  // __DOS_H
 
+// FA_DIREC, which getName below compares against, is a <dir.h> constant: it is
+// defined there in Borland's RTL, and in compat/borland/dir.h everywhere else.
+// <dos.h> alone is not enough on a compiler that ships its own dos.h, because
+// that one wins whatever the include path says -- see the note in
+// compat/borland/dir.h.
+#include <dir.h>
+
 inline const char *getName( void *k )
 {
     return ((TSearchRec *)k)->name;

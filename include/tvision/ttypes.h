@@ -55,7 +55,12 @@ typedef ulong uintptr_t;
 #endif
 
 struct TScreenCell;
-#if defined( __BORLANDC__ )
+/* The forward declarations have to agree with the definitions in colors.h, which
+   pick the legacy model for a compiler that cannot compile the modern one -- so
+   the same dialect test belongs here, and here is where it bites: with colors.h
+   typedefing TColorAttr to uchar and this branch still declaring `struct
+   TColorAttr`, the error is an invalid redefinition of the typedef name. */
+#if defined( __BORLANDC__ ) || __cplusplus < 201103L
 typedef uchar TColorAttr;
 typedef ushort TAttrPair;
 #else

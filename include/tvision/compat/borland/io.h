@@ -10,6 +10,12 @@
 #ifndef TVISION_COMPAT_IO_H
 #define TVISION_COMPAT_IO_H
 
+/* Guarded because compat/borland/dir.h defines the same struct: which of the two
+   is reachable depends on the compiler shipping a header of that own name, and
+   the type describes what a directory entry stores, so dir.h is as good a home as
+   this one.  See the note over the definition there. */
+#ifndef TVISION_COMPAT_FTIME
+#define TVISION_COMPAT_FTIME
 struct  ftime   {
   unsigned    ft_tsec  : 5;   /* Two second interval */
   unsigned    ft_min   : 6;   /* Minutes */
@@ -18,6 +24,7 @@ struct  ftime   {
   unsigned    ft_month : 4;   /* Months */
   unsigned    ft_year  : 7;   /* Year */
 };
+#endif
 
 #ifdef _MSC_VER
 #include <corecrt_io.h>

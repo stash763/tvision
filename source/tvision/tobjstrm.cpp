@@ -78,7 +78,14 @@
 // ios::open_mode and ios::seek_dir are deprecated in modern C++ and are
 // incompatible with the implementation-defined equivalents ios::openmode
 // and ios::seekdir. We simply redirect to the appropiate type on each platform.
-#ifdef __BORLANDC__
+//
+// Open Watcom is on the Borland side of that redirect, and it is a library fact
+// rather than a language one -- its <streambu> is the pre-standard streambuf,
+// with 'virtual int do_sputn( char const *, int )' and public seekoff/seekpos/
+// sync where a standard library has xsputn and the pub* wrappers, and its ios
+// has open_mode and seek_dir.  So every Borland test in this file reads
+// 'pre-standard iostreams', for these two names and no others.
+#if defined( __BORLANDC__ ) || defined( __WATCOMC__ )
     typedef ios::open_mode openmode;
     typedef ios::seek_dir seekdir;
 #else
@@ -220,10 +227,16 @@ int pstream::eof() const noexcept
     return state & ios::eofbit;
 }
 
+/* ios::hardfail is Borland's own -- the flag its RTL sets when a stream is to
+   stop rather than carry on -- and these three blocks exist because of it.  The
+   rest of this file reads 'pre-standard iostreams' for Open Watcom, but not
+   here: Watcom's ios has no hardfail at all, its flags running from skipws to
+   uppercase with badbit/eofbit/failbit (read out of D:\WATCOM\h\ios), so the
+   tests as written are already the whole story and adding the name is an error. */
 int pstream::fail() const noexcept
 {
     return state & (ios::failbit | ios::badbit
-#ifdef __BORLANDC__
+#if defined( __BORLANDC__ )
         | ios::hardfail
 #endif
     );
@@ -232,7 +245,7 @@ int pstream::fail() const noexcept
 int pstream::bad() const noexcept
 {
     return state & (ios::badbit
-#ifdef __BORLANDC__
+#if defined( __BORLANDC__ )
         | ios::hardfail
 #endif
     );
@@ -246,7 +259,7 @@ int pstream::good() const noexcept
 void pstream::clear( int i ) noexcept
 {
     state = (i & 0xFF)
-#ifdef __BORLANDC__
+#if defined( __BORLANDC__ )
         | (state & ios::hardfail)
 #endif
     ;
@@ -318,7 +331,7 @@ ipstream::~ipstream()
 
 streampos ipstream::tellg()
 {
-#ifdef __BORLANDC__
+#if defined( __BORLANDC__ ) || defined( __WATCOMC__ )
     return bp->seekoff( 0, ios::cur, ios::in );
 #else
     return bp->pubseekoff( 0, ios::cur, ios::in );
@@ -328,7 +341,7 @@ streampos ipstream::tellg()
 ipstream& ipstream::seekg( streampos pos )
 {
     objs.removeAll();
-#ifdef __BORLANDC__
+#if defined( __BORLANDC__ ) || defined( __WATCOMC__ )
     bp->seekoff( pos, ios::beg );
 #else
     bp->pubseekoff( pos, ios::beg );
@@ -339,7 +352,7 @@ ipstream& ipstream::seekg( streampos pos )
 ipstream& ipstream::seekg( streamoff off, pstream::seekdir dir )
 {
     objs.removeAll();
-#ifdef __BORLANDC__
+#if defined( __BORLANDC__ ) || defined( __WATCOMC__ )
     bp->seekoff( off, ::seekdir(dir) );
 #else
     bp->pubseekoff( off, ::seekdir(dir) );
@@ -563,7 +576,7 @@ opstream::~opstream()
 opstream& opstream::seekp( streampos pos )
 {
     objs->freeAll();
-#ifdef __BORLANDC__
+#if defined( __BORLANDC__ ) || defined( __WATCOMC__ )
     bp->seekoff( pos, ios::beg );
 #else
     bp->pubseekoff( pos, ios::beg );
@@ -574,7 +587,7 @@ opstream& opstream::seekp( streampos pos )
 opstream& opstream::seekp( streamoff pos, pstream::seekdir dir )
 {
     objs->freeAll();
-#ifdef __BORLANDC__
+#if defined( __BORLANDC__ ) || defined( __WATCOMC__ )
     bp->seekoff( pos, ::seekdir(dir) );
 #else
     bp->pubseekoff( pos, ::seekdir(dir) );
@@ -584,7 +597,7 @@ opstream& opstream::seekp( streamoff pos, pstream::seekdir dir )
 
 streampos opstream::tellp()
 {
-#ifdef __BORLANDC__
+#if defined( __BORLANDC__ ) || defined( __WATCOMC__ )
     return bp->seekoff( 0, ios::cur, ios::out );
 #else
     return bp->pubseekoff( 0, ios::cur, ios::out );
@@ -593,7 +606,7 @@ streampos opstream::tellp()
 
 opstream& opstream::flush()
 {
-#ifdef __BORLANDC__
+#if defined( __BORLANDC__ ) || defined( __WATCOMC__ )
     bp->sync();
 #else
     bp->pubsync();

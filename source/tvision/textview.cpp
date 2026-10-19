@@ -42,7 +42,7 @@ int TTextDevice::overflow( int c )
     return 1;
 }
 
-#if !defined( __BORLANDC__ )
+#if !defined( __BORLANDC__ ) && __cplusplus >= 201103L
 // The 'xsputn' method in modern STL is the equivalent of 'do_sputn' in
 // Borland's RTL. We must invoke 'do_sputn' here in order to replicate
 // the original behaviour. Otherwise, the default 'xsputn' will fall back on

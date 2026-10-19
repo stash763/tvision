@@ -58,7 +58,11 @@ ushort popupMenu(TPoint where, TMenuItem &aMenu, TGroup *receiver)
         // Generate an event.
         if (res && receiver)
         {
-            TEvent event = {};
+            /* '= {}' is C++11 list-initialisation.  The aggregate spelling below
+               does the same thing in C++98 -- 'what' from the one initialiser, the
+               union zeroed -- and means the same to a C++11 compiler, so no branch
+               is needed. */
+            TEvent event = { 0 };
             event.what = evCommand;
             event.message.command = res;
             receiver->putEvent(event);

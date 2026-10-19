@@ -10,7 +10,12 @@
 #ifndef TVISION_COLORS_H
 #define TVISION_COLORS_H
 
-#if defined( __BORLANDC__ )
+/* The legacy colour model: a BIOS attribute byte, no RGB.  It is here because
+   the model below is built out of C++11 -- constructors delegating to other
+   constructors, list-initialization, enums with a fixed underlying type -- so any
+   compiler predating C++11 needs it, not only Borland.  Borland takes the same
+   branch as ever: its __cplusplus does not reach 201103L. */
+#if defined( __BORLANDC__ ) || __cplusplus < 201103L
 
 // A BIOS color attribute byte. The lower four bits represent the foreground
 // color and the higher four bits the background color. Depending on the video

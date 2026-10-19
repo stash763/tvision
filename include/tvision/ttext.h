@@ -115,7 +115,7 @@ public:
                             TStringView text, size_t &j,
                             TColorAttr attr ) noexcept;
 
-#ifndef __BORLANDC__
+#if !defined( __BORLANDC__ ) && __cplusplus >= 201103L
     // Variants of the functions above which use a '(TColorAttr &) -> void'
     // callback  to change the color attribute of each cell (rather than
     // setting it to a fixed value).
@@ -163,7 +163,11 @@ private:
 #endif // __BORLANDC__
 };
 
-#ifdef __BORLANDC__
+#if defined( __BORLANDC__ ) || __cplusplus < 201103L
+// The single-byte implementations of everything above, complete and inline, for
+// compilers that cannot compile the ones in source/platform/ttext.cpp.  The
+// callback variants are out: a forwarding reference parameter plus the generic
+// lambdas that call it are C++11 and later.
 
 inline size_t TText::width(TStringView text)
 {

@@ -9,7 +9,12 @@
 #ifndef TVISION_SCRNCELL_H
 #define TVISION_SCRNCELL_H
 
-#if defined( __BORLANDC__ )
+/* The DOS text-mode cell: one character and one attribute byte, which is what
+   the legacy colour model has to write and what a BIOS or VIO screen actually is.
+   The cell below, holding a TScreenCharacter and a TColorAttr, needs C++11 to
+   compile at all, so every pre-C++11 compiler takes this one (Borland among them,
+   as before -- see colors.h, whose model this one goes with). */
+#if defined( __BORLANDC__ ) || __cplusplus < 201103L
 
 // Struct that replicates the memory layout of a DOS text mode screen cell,
 // with optimized custom operators for converting to and from unsigned short.

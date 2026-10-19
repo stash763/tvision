@@ -14,7 +14,20 @@
  *
  */
 
-#if !defined( __BORLANDC__ )
+/* The substitutions below turn a compiler that is neither Borland nor Windows
+   into something the rest of this file expects: __FLAT__ for the memory model,
+   empty calling-convention keywords, and _TV_UNIX for the operating system.
+   That last one is the assumption, and Open Watcom is where it breaks: Watcom
+   already defines __FLAT__ itself in a flat-model compile, already knows
+   __cdecl and __stdcall as keywords rather than names to be defined away, and is
+   not Unix -- no termios, no sigaction, no /dev/tty, none of what _TV_UNIX
+   selects.  Watcom on OS/2 defines __OS2__ and not __NT__ (measured with
+   a macro dump run on the target (macro_dump.cpp, kept with the OS/2 port of
+   this library), because the alternative is guessing about the one
+   header every other header reads first). */
+#if defined( __WATCOMC__ )
+
+#elif !defined( __BORLANDC__ )
 #define __FLAT__
 
 #if !defined( _WIN32 )
