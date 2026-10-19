@@ -59,6 +59,21 @@
 
 #include <stdint.h>
 
+#if defined( __OS2__ )
+/* OS/2 is this file's other Windows-shaped platform, and it has the same shape of
+   problem: <os2.h> is the one place BOOL, CHAR, LONG and the rest are named, and
+   a second typedef of a name is an error to a C++ compiler even when the two
+   agree -- while CHAR, SHORT, LONG and INT there are macros, so restating them is
+   not even a duplicate but a syntax error.  Asking for that header here, rather
+   than leaving each program to have read it first, is what the Borland branch
+   above does with <windows.h>, and it is the only arrangement that keeps one
+   meaning for BOOL in every translation unit: where the type comes from one
+   header and not from the include order of the file that happens to use it.
+   Otherwise the driver's THardwareInfo::getKeyEvent and everybody's idea of the
+   same member are two different symbols, which is a link error, not a warning. */
+#include <os2.h>
+#endif
+
 extern "C"
 {
 
@@ -66,20 +81,40 @@ extern "C"
 
 typedef void *PVOID;
 typedef PVOID HANDLE;
+/* The four base types here, INT below and BOOL below that are names <os2.h>
+   defines as macros -- CHAR for char, LONG for long, and so on -- so once that
+   header has been read they are type names already and restating them is not a
+   duplicate but a syntax error.  See the note at BOOL. */
+#if !defined( OS2DEF_INCLUDED )
 typedef char CHAR;
 typedef short SHORT;
 typedef int32_t LONG;
+#endif
 typedef wchar_t WCHAR;
+#if !defined( OS2DEF_INCLUDED )     // Taken from <os2.h> there, see below.
 typedef int64_t LONGLONG;
 typedef uint64_t ULONGLONG;
+#endif
 
 // windef.h
 
 typedef uint32_t            DWORD;
+/* <os2.h> typedefs three of the names in this file: BOOL as an unsigned long
+   rather than an int, and LONGLONG and ULONGLONG as pairs of words rather than as
+   64-bit integers.  A second typedef of a name is an error to a C++ compiler even
+   when the two agree, so these three are left to the platform header wherever it
+   has already been read -- which is what its own guard says, and what every OS/2
+   program that talks to the console or the file system ends up doing before it
+   reaches tvision.  Nothing outside the Windows driver uses LONGLONG or
+   ULONGLONG, and BOOL only has to carry TRUE and FALSE. */
+#if !defined( OS2DEF_INCLUDED )
 typedef int                 BOOL;
+#endif
 typedef unsigned char       BYTE;
 typedef unsigned short      WORD;
+#if !defined( OS2DEF_INCLUDED )
 typedef int                 INT;
+#endif
 typedef unsigned int        UINT;
 
 #define MAX_PATH 260
