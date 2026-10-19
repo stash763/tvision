@@ -446,7 +446,16 @@ public:
     void writeLine( short x, short y, short w, short h, const TDrawBuffer& b ) noexcept;
     void writeLine( short x, short y, short w, short h, const void _FAR *b ) noexcept;
     void writeStr( short x, short y, const char *str, uchar color ) noexcept;
-#ifndef __BORLANDC__
+
+/* The cell-typed spellings of the two buffer writers are needed only where a
+   TScreenCell is not the word a screen cell is: with the legacy cell, the void*
+   versions above already step one cell at a time, which is why
+   source/tvision/tvwrite.cpp defines these under the test that picks the modern
+   model.  "Not Borland" used to be that test.  Declaring them for a build that
+   has the legacy model -- every compiler predating C++11 -- leaves callers
+   bound to symbols nothing can define, and the compile passes: only the link
+   says so. */
+#if !defined( __BORLANDC__ ) && __cplusplus >= 201103L
     void writeBuf(  short x, short y, short w, short h, const TScreenCell *b ) noexcept;
     void writeLine( short x, short y, short w, short h, const TScreenCell *b ) noexcept;
 #endif
@@ -483,7 +492,9 @@ private:
     void change( uchar, TPoint delta, TPoint& p, TPoint& s, ushort ctrlState ) noexcept;
     static void writeView( write_args );
     void writeView( short x, short y, short count, const void _FAR* b ) noexcept;
-#ifndef __BORLANDC__
+#if !defined( __BORLANDC__ ) && __cplusplus >= 201103L
+    // Same test as TView::writeBuf above: the cell-typed overload belongs to the
+    // modern model, and is defined there.
     void writeView( short x, short y, short count, const TScreenCell* b ) noexcept;
 #endif
 
