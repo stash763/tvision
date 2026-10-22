@@ -84,6 +84,59 @@ enum
     kDefaultAttr = 0x07 // Light grey on black: leave it to the terminal.
     };
 
+#ifdef TV_DEBUG_LOOP
+/* Compiled out unless the build passes -DTV_DEBUG_LOOP, and it is there for one
+   measurement: atui's own log showed the UI thread dispatching no timer event for 317
+   seconds while a worker thread drove a turn (TESTING.md, "A whole turn on a thread, in
+   the app").  Two places can swallow a timer and they look identical from the
+   application -- this wait not returning, or the loop above it not collecting timers --
+   and the only thing that tells them apart is a number from inside the wait.  Aggregated
+   about once a second rather than one line per call, because the call rate is itself
+   what is being measured, and one line immediately when a wait runs long, because a
+   wait that never returns is the interesting case and it still gets said. */
+static uint64_t gWaitLastReportMs = 0;
+static int gWaitCalls = 0;
+static long gWaitMs = 0;
+static long gWaitLongestMs = 0;
+static int gWaitLongestAsked = 0;
+static int gWaitLastAsked = 0;
+static const char *gWaitLastHow = "";
+
+static void noteWait( int askedMs, uint64_t tookMs, const char *how, Boolean report )
+{
+    const uint64_t nowMs = THardwareInfo::getTickCountMs();
+
+    ++gWaitCalls;
+    gWaitMs += tookMs;
+    gWaitLastAsked = askedMs;
+    gWaitLastHow = how;
+    if( tookMs > gWaitLongestMs )
+    {
+        gWaitLongestMs = tookMs;
+        gWaitLongestAsked = askedMs;
+    }
+
+    if( tookMs >= 1000 )
+    {
+        fprintf( stderr, "[tvwait] LONG wait: asked %d ms, took %lu ms (%s)\n",
+                 askedMs, (unsigned long) tookMs, how );
+        fflush( stderr );
+    }
+    if( report && nowMs - gWaitLastReportMs >= 1000 )
+    {
+        fprintf( stderr, "[tvwait] %d calls, %lu ms total, longest %lu ms (asked %d), "
+                 "last asked %d (%s)\n",
+                 gWaitCalls, (unsigned long) gWaitMs, (unsigned long) gWaitLongestMs,
+                 gWaitLongestAsked, gWaitLastAsked, gWaitLastHow );
+        fflush( stderr );
+        gWaitLastReportMs = nowMs;
+        gWaitCalls = 0;
+        gWaitMs = 0;
+        gWaitLongestMs = 0;
+    }
+}
+#endif // TV_DEBUG_LOOP
+
 // What the terminal is set to, so that a run of cells emits one attribute
 // change rather than one per cell.  -1 means the terminal's state is not known
 // to us, which is how it starts and how it is left by anything that resets it.
@@ -789,6 +842,31 @@ BOOL THardwareInfo::getKeyEvent( TEvent& event ) noexcept
 
 void THardwareInfo::waitForEvents( int timeoutMs ) noexcept
 {
+#ifdef TV_DEBUG_LOOP
+    const uint64_t t0 = THardwareInfo::getTickCountMs();
+    if( anyInput() )
+        {
+        noteWait( timeoutMs, 0, "input already ready", True );
+        return;
+        }
+
+    int waited = 0;
+    const char *how = "timeout";
+    while( !anyInput() )
+        {
+        if( gInterruptWait )
+            {
+            how = "interrupted";
+            break;
+            }
+        if( timeoutMs >= 0 && waited >= timeoutMs )
+            break;
+        DosSleep( kPollMs );
+        waited += kPollMs;
+        }
+    gInterruptWait = False;
+    noteWait( timeoutMs, THardwareInfo::getTickCountMs() - t0, how, True );
+#else
     if( anyInput() )
         return;
 
@@ -803,6 +881,7 @@ void THardwareInfo::waitForEvents( int timeoutMs ) noexcept
         waited += kPollMs;
         }
     gInterruptWait = False;
+#endif
 }
 
 void THardwareInfo::interruptEventWait() noexcept
