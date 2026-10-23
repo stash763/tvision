@@ -1,7 +1,8 @@
 /*------------------------------------------------------------*/
 /* filename -       hardwvos2.cpp                             */
 /*                                                            */
-/* THardwareInfo for OS/2 32-bit: VT escapes out, keys in.    */
+/* THardwareInfo for OS/2 32-bit: VIO when there is a screen, */
+/* VT escapes when there is not, keys from the session.       */
 /*------------------------------------------------------------*/
 /*
  * hardwrvr.cpp holds the driver bodies for Borland's Windows console and leaves
@@ -11,21 +12,31 @@
  * compiler (Open Watcom) builds the classic classes and cannot build the modern
  * terminal layer in source/platform.
  *
- * It draws with VT escapes on stdout and reads keystrokes from stdin.  The other
- * driver this could have been -- VIO, the console the box owns -- was tried first
- * and measured: every Vio* entry point resolves in os2386.lib and then fails in a
- * process the telnet server started, with ERROR_VIO_INVALID_HANDLE (436), and
- * KbdPeek fails with 445.  A screen that works only while somebody sits at the
- * machine is of no use to a program whose job is to be reached over a network, so
- * escapes are the driver and VIO stays port work.  The price of that is honest
- * and worth stating: OS/2's own full-screen session is not a VT terminal, so
- * nothing here renders on the box's own display.
+ * Two displays, chosen once at construction by asking for one:
+ *
+ *   VIO    the screen the session owns.  Tried first, ruled out by a probe that
+ *          passed 1 as the session handle and took the resulting
+ *          ERROR_VIO_INVALID_HANDLE (436) for a policy of the system; the handle
+ *          is 0, and with it the whole of it works -- geometry, cells, attributes,
+ *          cursor, keyboard -- in a session the telnet server started as well as
+ *          at the machine's own screen.  It is the display, and the only way to
+ *          learn the size of the screen instead of being told it.
+ *
+ *   VT     escapes on stdout, for a session with no VIO screen and for a client
+ *          that cannot render one.  ATUI_OS2_STREAM=1 asks for it deliberately.
+ *          Its one cost is that OS/2's own full-screen session is not a VT
+ *          terminal, so nothing drawn this way appears on the box's display.
+ *
+ * Which of the two is in use is decided in the constructor and asked by every
+ * output member, so nothing above this file knows there is a choice.
  *
  * Three measurements in TESTING.md shaped the input loop, and each is the kind
  * that reads as a bug in the driver if it is not written down beside the code:
  *
  *   * select() does not work on the console handle; it returns -1.  Readiness is
- *     polled with kbhit(), which does see every byte.
+ *     polled with kbhit(), which does see every byte.  (kbhit() is itself
+ *     KbdPeek in Open Watcom's run time, which is why the same input path serves
+ *     either display: the RTL and this driver ask the keyboard the same question.)
  *   * The session translates incoming VT sequences into DOS extended codes, so an
  *     arrow key arrives as 0xE0 and then the BIOS scan code, and F1 as 0x00 0x3B.
  *     Reading a key therefore means taking a prefix and then its tail.
@@ -40,6 +51,9 @@
  *     character, not the keys that made it, so the modifier bits stay empty except
  *     where the byte itself proves one (a control byte is Ctrl plus a letter) or
  *     where an escape sequence carries one.  Mouse reports do carry modifiers.
+ *     (VIO could know the shift state from KbdPeek and does not, because the keys
+ *     are taken from the same place either way and the state would have to be read
+ *     twice to be compared.)
  *   * Home and End over a session that eats the introducer.  Measured: Home
  *     arrives as '[' then 'H', End as '[' then 'F', the Escape having been lost on
  *     the way.  Treating a bare bracket as half a key would misread a pasted "[H",
@@ -47,8 +61,16 @@
  *   * The clipboard.  The Presentation Manager clipboard belongs to a session this
  *     process does not have; the terminal's own clipboard, asked for with OSC 52,
  *     is the way to do it here.
- *   * Noticing that the window was resized.  Nothing tells a stream driver, so the
- *     size is taken once, from ATUI_COLS and ATUI_ROWS if they are set and 80x25
+ *   * Mouse events drawn from the machine's own mouse.  MouOpen and MouGetNumButtons
+ *     answer under VIO, so getButtonCount() tells the truth there, but events would
+ *     take a registered queue and that is work for after the display.  Over a
+ *     session the mouse is reported by escapes, as before.
+ *   * Noticing that the window was resized.  With VIO the size is asked once, and
+ *     asked correctly: an OS/2 session's screen does not resize under a running
+ *     program, and the telnet server's does not resize at all -- measured 80x25
+ *     both for a client whose window was 100x40 at login and for an 80x25 session
+ *     resized afterwards.  A stream driver cannot know either way, so there the
+ *     size is taken from ATUI_COLS and ATUI_ROWS if they are set and 80x25
  *     otherwise, and stays until something calls setScreenMode.
  */
 
@@ -57,8 +79,11 @@
 /* tvision's compat/windows/windows.h asks for <os2.h> on this platform, so the
    feature macros have to be set before tv.h is read rather than with the include
    below -- otherwise DosSleep is not in the header by the time this file wants
-   it, and the first read of <os2.h> is the one that decides. */
+   it, and the first read of <os2.h> is the one that decides.  INCL_VIO for the
+   screen; INCL_DOSERRORS for NO_ERROR, which every VIO call is answered with. */
 #define INCL_DOSPROCESS
+#define INCL_DOSERRORS
+#define INCL_VIO
 
 #define Uses_TKeys
 #define Uses_TEvent
@@ -647,6 +672,205 @@ static int decodeEvent( TEvent &event, MouseEventType &mouse )
     return kDecodedKey;
 }
 
+/*
+ * The VIO back end: the screen this session owns.
+ *
+ * Session handle 0.  Not 1: that is a word from the 16-bit guarded-segment era
+ * rather than a value to pass, and every Vio* call answers a bad handle with 436
+ * (ERROR_VIO_INVALID_HANDLE), which is what this driver was written away from
+ * once.  KbdOpen(0) and MouOpen(0) succeeding in the same probe run as those 436s
+ * is the shape of the mistake: a process with no session does not get a keyboard.
+ *
+ * These entry points never left the 16-bit interface -- APIRET16 APIENTRY16 --
+ * and it shows in two ways worth knowing before writing against them: the sizes
+ * are USHORT where a 32-bit API would use PULONG (VioGetBuf, VioReadCellStr,
+ * VioGetAnsi), and the write call is VioWrtCellStr, keeping the name OS/2 1.x gave
+ * it.  VioReadCellStr's count goes in as the bytes asked for and comes back as the
+ * bytes read; VioWrtCellStr's is the bytes of the string, a cell being a character
+ * and an attribute byte -- the same byte the rest of tvision carries, which is why
+ * no colour mapping is needed here.
+ *
+ * And the geometry: VIOMODEINFO.row and .col are the count of rows and columns,
+ * not the index of the last one.  Asking VioReadCellStr for row 25 of a 25-row
+ * screen answers 358 (ERROR_VIO_ROW), which is the error this driver used to
+ * produce before it had read the struct properly.
+ */
+
+static const ushort kVioSession = 0;
+
+static Boolean gVio = False;              // drawing with VIO rather than escapes
+static uchar *gVioRow = 0;                // one row of cells, interleaved
+static ushort gVioRowCols = 0;
+
+// The screen as it was found, to put back on the way out.  A stream driver asks
+// the terminal for an alternate screen; VIO has no such thing and needs none,
+// because the screen can be read.
+static uchar *gVioSaved = 0;
+static ushort gVioSavedRows = 0;
+static ushort gVioSavedCols = 0;
+static ushort gVioSavedCurRow = 0;
+static ushort gVioSavedCurCol = 0;
+static VIOCURSORINFO gVioSavedCurType;
+static Boolean gVioSavedCurTypeOk = False;
+static Boolean gVioScreenSaved = False;
+
+/* The staging row, as wide as the screen.  Called before each write rather than
+   once at startup because setScreenMode can change the width. */
+static Boolean vioEnsureRow()
+{
+    if( gVioRow != 0 && gVioRowCols == gCols )
+        return True;
+    delete[] gVioRow;
+    gVioRow = new uchar[(size_t) gCols * 2];
+    gVioRowCols = 0;
+    if( gVioRow == 0 )
+        return False;
+    gVioRowCols = gCols;
+    return True;
+}
+
+/* Ask the session how big its screen is.  False means either that there is no
+   VIO screen -- which is what a session started without one answers -- or that it
+   is too small to lay the application out in, and in both cases the escape driver
+   is the better of two bad options. */
+static Boolean vioOpen()
+{
+    VIOMODEINFO mode;
+
+    memset( &mode, 0, sizeof( mode ) );
+    mode.cb = sizeof( mode );
+    if( VioGetMode( &mode, kVioSession ) != NO_ERROR )
+        return False;
+    if( mode.row < 2 || mode.col < 20 )
+        return False;
+
+    gRows = mode.row;                 // counts, not last index: see above
+    gCols = mode.col;
+    return vioEnsureRow();
+}
+
+/* A run of cells at the place the classic writer worked out for them.  Written
+   raw: unlike a stream there is nothing here that a control byte could be
+   mistaken for, and writing what the cell holds keeps the shadow an exact account
+   of the screen rather than an approximation of it. */
+static void vioWriteRun( ushort x, ushort y, const CHAR_INFO *buf, ushort len )
+{
+    if( !vioEnsureRow() || len == 0 || len > gVioRowCols || x + len > gVioRowCols )
+        return;
+
+    for( ushort i = 0; i < len; ++i )
+        {
+        gVioRow[ i * 2 ]     = (uchar) buf[i].Char.AsciiChar;
+        gVioRow[ i * 2 + 1 ] = (uchar) ( buf[i].Attributes & 0xFF );
+        }
+    VioWrtCellStr( (PCH) gVioRow, (USHORT) ( len * 2 ), y, x, kVioSession );
+}
+
+static void vioClearScreen()
+{
+    /* VioWrtNCell would be the obvious call, and its count is documented in
+       cells where VioWrtCellStr's is in bytes; a staged row of blanks costs a
+       loop this one cannot be misread in. */
+    if( !vioEnsureRow() )
+        return;
+
+    for( ushort i = 0; i < gCols; ++i )
+        {
+        gVioRow[ i * 2 ]     = ' ';
+        gVioRow[ i * 2 + 1 ] = kDefaultAttr;
+        }
+    for( ushort y = 0; y < gRows; ++y )
+        VioWrtCellStr( (PCH) gVioRow, (USHORT) ( gCols * 2 ), y, 0, kVioSession );
+}
+
+/* Take the screen in, once.  Called from setUpConsole, which is called more than
+   once if the application ever suspends itself, and only the first call counts:
+   a second would save what the program had drawn. */
+static void vioSaveScreen()
+{
+    if( gVioScreenSaved || gVioSaved != 0 )
+        return;
+
+    gVioSaved = new uchar[(size_t) gRows * gCols * 2];
+    if( gVioSaved == 0 )
+        return;
+
+    for( ushort y = 0; y < gRows; ++y )
+        {
+        USHORT count = (USHORT) ( gCols * 2 );
+        if( VioReadCellStr( (PCH) ( gVioSaved + (size_t) y * gCols * 2 ), &count,
+                            y, 0, kVioSession ) != NO_ERROR )
+            {
+            delete[] gVioSaved;
+            gVioSaved = 0;
+            return;                 // no saved screen: exit leaves the session as
+                                    // the program left it, which is worse than
+                                    // restoring and the only honest fallback
+            }
+        }
+
+    if( VioGetCurPos( &gVioSavedCurRow, &gVioSavedCurCol, kVioSession )
+        != NO_ERROR )
+        {
+        gVioSavedCurRow = 0;
+        gVioSavedCurCol = 0;
+        }
+    memset( &gVioSavedCurType, 0, sizeof( gVioSavedCurType ) );
+    gVioSavedCurTypeOk =
+        ( VioGetCurType( &gVioSavedCurType, kVioSession ) == NO_ERROR );
+
+    gVioSavedRows = gRows;
+    gVioSavedCols = gCols;
+    gVioScreenSaved = True;
+}
+
+static void vioRestoreScreen()
+{
+    if( gVioSaved == 0 )
+        return;
+
+    for( ushort y = 0; y < gVioSavedRows; ++y )
+        VioWrtCellStr( (PCH) ( gVioSaved + (size_t) y * gVioSavedCols * 2 ),
+                       (USHORT) ( gVioSavedCols * 2 ), y, 0, kVioSession );
+    VioSetCurPos( gVioSavedCurRow, gVioSavedCurCol, kVioSession );
+    if( gVioSavedCurTypeOk )
+        VioSetCurType( &gVioSavedCurType, kVioSession );
+
+    delete[] gVioSaved;
+    gVioSaved = 0;
+    gVioSavedRows = 0;
+    gVioSavedCols = 0;
+    gVioScreenSaved = False;
+}
+
+/* The cursor's shape as the session had it, shown or hidden.  This is the 16-bit
+   cursor struct, which has no visibility flag: an attr of 0xFFFF is an invisible
+   cursor, as it is in Open Watcom's own OS/2 code, and any other value both shows
+   the cursor and says what it is drawn with. */
+static void vioShowCaret( Boolean shown )
+{
+    VIOCURSORINFO shape;
+
+    memset( &shape, 0, sizeof( shape ) );
+    if( gVioSavedCurTypeOk )
+        shape = gVioSavedCurType;
+    else
+        {
+        shape.yStart = 14;            // the shape this session was measured with:
+        shape.cEnd = 15;              // an underscore one scanline high
+        shape.cx = 1;
+        shape.attr = 1;
+        }
+    if( shown )
+        {
+        if( shape.attr == 0xFFFF )
+            shape.attr = 1;
+        }
+    else
+        shape.attr = 0xFFFF;
+    VioSetCurType( &shape, kVioSession );
+}
+
 //
 // Construction
 //
@@ -657,22 +881,38 @@ THardwareInfo::THardwareInfo() noexcept
     // classic code reads as "a DOS machine I may poke".
     platform = plOS2;
 
-    // The size is asked for before anything is drawn, and a stream driver cannot
-    // know it: the terminal is at the other end of a pipe as far as this process
-    // is concerned.  So it is stated rather than discovered.
-    const char *env = getenv( "ATUI_COLS" );
-    if( env != NULL )
+    /* Ask for the screen.  If the session has one this is the display, and it is
+       also the only source of the size: VioGetMode says how many rows and columns
+       there are, which is what the application then lays out in.  ATUI_OS2_STREAM
+       declines it -- for a client that cannot render VIO, since a session renders
+       its screen to a client that has said ANSI and not to one that has said
+       pcansi or nothing at all. */
+    if( getenv( "ATUI_OS2_STREAM" ) == NULL )
+        gVio = vioOpen();
+
+    /* Without a VIO screen the size has to be stated, because a stream cannot be
+     * asked: the terminal is at the other end of a pipe as far as this process is
+     * concerned.  With one, these two variables would only make the application
+     * lie about the screen it is being given.
+     *
+     * They are still read when VIO is not in use, which is what keeps an escape
+     * session in a window of any size usable. */
+    if( !gVio )
         {
-        int n = atoi( env );
-        if( n >= 20 && n <= 255 )
-            gCols = (ushort) n;
-        }
-    env = getenv( "ATUI_ROWS" );
-    if( env != NULL )
-        {
-        int n = atoi( env );
-        if( n >= 2 && n <= 99 )
-            gRows = (ushort) n;
+        const char *env = getenv( "ATUI_COLS" );
+        if( env != NULL )
+            {
+            int n = atoi( env );
+            if( n >= 20 && n <= 255 )
+                gCols = (ushort) n;
+            }
+        env = getenv( "ATUI_ROWS" );
+        if( env != NULL )
+            {
+            int n = atoi( env );
+            if( n >= 2 && n <= 99 )
+                gRows = (ushort) n;
+            }
         }
 
     sbInfo.dwSize.X = gCols;
@@ -687,6 +927,9 @@ THardwareInfo::THardwareInfo() noexcept
 THardwareInfo::~THardwareInfo()
 {
     restoreConsole();
+    delete[] gVioRow;
+    gVioRow = 0;
+    gVioRowCols = 0;
 }
 
 //
@@ -720,6 +963,11 @@ void THardwareInfo::setCaretSize( ushort size ) noexcept
     if( gCaretShown == shown )
         return;
     gCaretShown = shown;
+    if( gVio )
+        {
+        vioShowCaret( shown ? True : False );
+        return;
+        }
     outStr( shown ? "\x1b[?25h" : "\x1b[?25l" );
 }
 
@@ -729,6 +977,22 @@ void THardwareInfo::setCaretPosition( ushort x, ushort y ) noexcept
     gCaretY = y;
     sbInfo.dwCursorPosition.X = (SHORT) x;
     sbInfo.dwCursorPosition.Y = (SHORT) y;
+    if( gVio )
+        {
+        /* The session's cursor, moved to where the application says its caret
+           goes.  Note that this one is not worth skipping: writing cells does not
+           move the cursor along, as it does on a stream, so there is no state in
+           which it is already right and the call costs a trap to the kernel
+           instead of six bytes on a wire. */
+        if( gTermX != x || gTermY != y || !gTermPosKnown )
+            {
+            VioSetCurPos( y, x, kVioSession );
+            gTermX = x;
+            gTermY = y;
+            gTermPosKnown = True;
+            }
+        return;
+        }
     // The same argument as above, in cursor addresses: a caret that has not moved
     // does not need to be told where it is, and after any write to the screen the
     // terminal's cursor is wherever that write left it (so this has to say so).
@@ -760,6 +1024,32 @@ ushort THardwareInfo::getScreenMode() noexcept
 
 void THardwareInfo::setScreenMode( ushort mode ) noexcept
 {
+    if( gVio )
+        {
+        /* The session's mode is not ours to change: VioSetMode would put the
+           machine's display into another video mode, which is not what a
+           TDisplay::setMode() call means to do to a user, and a session cannot be
+           resized under a running program anyway.  So the mode is asked for again
+           -- it can differ from what was read at construction if a shell changed
+           it before starting us -- and whatever it is stays. */
+        ushort wasRows = gRows;
+        ushort wasCols = gCols;
+        if( !vioOpen() )
+            {
+            gRows = wasRows;            // a failed re-ask must not shrink the
+            gCols = wasCols;            // application's idea of its own screen
+            return;
+            }
+        sbInfo.dwSize.X = gCols;
+        sbInfo.dwSize.Y = gRows;
+        if( gRows != wasRows || gCols != wasCols )
+            {
+            ensureShadow();
+            forgetScreen();
+            }
+        return;
+        }
+
     gRows = (mode & TDisplay::smFont8x8) ? 50 : 25;
     sbInfo.dwSize.X = gCols;
     sbInfo.dwSize.Y = gRows;
@@ -782,6 +1072,12 @@ void THardwareInfo::setScreenMode( ushort mode ) noexcept
 
 void THardwareInfo::clearScreen( ushort, ushort ) noexcept
 {
+    if( gVio )
+        {
+        vioClearScreen();
+        rememberScreenCleared();
+        return;
+        }
     // A VT clear is the whole screen, so the extent asked for is not used.
     outStr( "\x1b[0m\x1b[2J\x1b[H" );
     gAttr = -1;
@@ -793,6 +1089,16 @@ void THardwareInfo::clearScreen( ushort, ushort ) noexcept
 
 void THardwareInfo::flushScreen() noexcept
 {
+    if( gVio )
+        {
+        /* Cell writes go to the screen as they are made and leave the cursor
+           where it was, so there is nothing to push and no caret to put back --
+           the pending-wrap problem this call exists for on a stream is a thing a
+           screen buffer does not have.  stdout is flushed because the application
+           may have written a line of its own to it, and that does need moving. */
+        fflush( stdout );
+        return;
+        }
     // The writes have moved the terminal's cursor along from wherever the application
     // put it, and it stays there; putting it back is what makes the difference between a
     // caret and a stray block.  Which is also why it can be skipped: nothing has been
@@ -841,6 +1147,18 @@ void THardwareInfo::screenWrite( ushort x, ushort y, CHAR_INFO *buf, DWORD len )
         while( i < len && !cellIsCurrent( (ushort) ( x + i ), y, buf[i] ) )
             ++i;
 
+        if( gVio )
+            {
+            /* One call for the whole run: a cell write carries its own attribute,
+               so the attribute grouping the stream path does below -- one escape
+               per run of like colours -- buys nothing here. */
+            for( DWORD v = first; v < i; ++v )
+                rememberCell( (ushort) ( x + v ), y, buf[v] );
+            vioWriteRun( (ushort) ( x + first ), y, &buf[first],
+                         (ushort) ( i - first ) );
+            continue;
+            }
+
         moveTo( (ushort) ( x + first ), y );
 
         DWORD at = first;
@@ -884,6 +1202,23 @@ void THardwareInfo::freeScreenBuffer( TScreenCell *buffer ) noexcept
 
 void THardwareInfo::setUpConsole() noexcept
 {
+    if( gVio )
+        {
+        /* Read the session's screen in, then blank it.  There is no alternate
+           screen to ask for and none is needed: what is put back on the way out is
+           what was read here, including the shell's scrollback, because a screen
+           buffer can be read as well as written. */
+        vioSaveScreen();
+        ensureShadow();
+        vioClearScreen();
+        rememberScreenCleared();
+        // The session's cursor is where the shell left it, which is the one thing
+        // this driver no longer knows until something says otherwise.
+        gTermPosKnown = False;
+        gCaretShown = -1;
+        return;
+        }
+
     // Ask for the alternate screen.  A terminal without it ignores the escape, so
     // asking costs nothing and a terminal that has it gives the user back whatever
     // was on the screen before the program ran.
@@ -906,12 +1241,18 @@ void THardwareInfo::setUpConsole() noexcept
 
 void THardwareInfo::restoreConsole() noexcept
 {
-    outStr( "\x1b[?1000l\x1b[?1002l\x1b[?1006l" );   // mouse reports off
-    outStr( "\x1b[0m\x1b[?25h" );                    // the terminal's own cursor back
-    outStr( "\x1b[H\x1b[J" );                        // and a clean screen under it
-    outStr( "\x1b[?1049l" );
-    gAttr = -1;
-    gCaretShown = 1;              // the \x1b[?25h above is what the terminal now has
+    if( gVio )
+        vioRestoreScreen();
+    else
+        {
+        outStr( "\x1b[?1000l\x1b[?1002l\x1b[?1006l" );   // mouse reports off
+        outStr( "\x1b[0m\x1b[?25h" );                    // the terminal's own cursor back
+        outStr( "\x1b[H\x1b[J" );                        // and a clean screen under it
+        outStr( "\x1b[?1049l" );
+        gAttr = -1;
+        gCaretShown = 1;          // the \x1b[?25h above is what the terminal now has
+        }
+
     delete[] gShadowCh;
     delete[] gShadowAttr;
     gShadowCh = 0;
@@ -935,6 +1276,9 @@ DWORD THardwareInfo::getButtonCount() noexcept
 
 void THardwareInfo::cursorOn() noexcept
 {
+    if( gVio )
+        return;       // asking for mouse reports with escapes on a screen that is
+                      // not a terminal would put the request on the screen
     // Press and release, drag with a button held, and SGR coordinates, which are
     // the only report that survives a window past 223 columns in either axis.
     outStr( "\x1b[?1000h\x1b[?1002h\x1b[?1006h" );
@@ -942,6 +1286,8 @@ void THardwareInfo::cursorOn() noexcept
 
 void THardwareInfo::cursorOff() noexcept
 {
+    if( gVio )
+        return;
     outStr( "\x1b[?1000l\x1b[?1002l\x1b[?1006l" );
 }
 
