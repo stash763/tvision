@@ -47,24 +47,26 @@
  *
  * What this driver does not do, and why:
  *
- *   * Shift and control state for ordinary keys.  A character stream carries the
+ *   * Shift and control state on the stream path.  A character stream carries the
  *     character, not the keys that made it, so the modifier bits stay empty except
  *     where the byte itself proves one (a control byte is Ctrl plus a letter) or
  *     where an escape sequence carries one.  Mouse reports do carry modifiers.
- *     (VIO could know the shift state from KbdPeek and does not, because the keys
- *     are taken from the same place either way and the state would have to be read
- *     twice to be compared.)
+ *     Under VIO this is not a guess at all: the keyboard record carries the
+ *     modifier state beside the key, which is what makes the menu bar's Alt
+ *     hotkeys work at a real keyboard.
  *   * Home and End over a session that eats the introducer.  Measured: Home
  *     arrives as '[' then 'H', End as '[' then 'F', the Escape having been lost on
  *     the way.  Treating a bare bracket as half a key would misread a pasted "[H",
  *     so a bracket stays a bracket and those two keys are the session's to fix.
+ *     Under VIO they are not: the keyboard reports Home as 0xE0/0x47 and End as
+ *     0xE0/0x4F whatever the client in front of the session does with escapes.
  *   * The clipboard.  The Presentation Manager clipboard belongs to a session this
  *     process does not have; the terminal's own clipboard, asked for with OSC 52,
  *     is the way to do it here.
- *   * Mouse events drawn from the machine's own mouse.  MouOpen and MouGetNumButtons
- *     answer under VIO, so getButtonCount() tells the truth there, but events would
- *     take a registered queue and that is work for after the display.  Over a
- *     session the mouse is reported by escapes, as before.
+ *   * Mouse wheel.  There is no wheel in the OS/2 mouse interface of this
+ *     generation -- three buttons and a position -- so a wheel event cannot come
+ *     from the machine's own mouse.  Over a session, where the terminal reports
+ *     one as an escape, it does.
  *   * Noticing that the window was resized.  With VIO the size is asked once, and
  *     asked correctly: an OS/2 session's screen does not resize under a running
  *     program, and the telnet server's does not resize at all -- measured 80x25
@@ -84,6 +86,8 @@
 #define INCL_DOSPROCESS
 #define INCL_DOSERRORS
 #define INCL_VIO
+#define INCL_KBD
+#define INCL_MOU
 
 #define Uses_TKeys
 #define Uses_TEvent
@@ -169,6 +173,13 @@ static int gAttr = -1;
 
 static ushort gCols = kDefCols;
 static ushort gRows = kDefRows;
+
+/* Which of the two displays this is: cells or escapes.  Set once in the
+   constructor and asked by every member that draws or reads a key.  It is
+   declared here rather than with the VIO code below because the input helpers
+   are above that, and reading a key means knowing which of the two ways the
+   keyboard is being read. */
+static Boolean gVio = False;
 
 // The caret as the application left it.  Emitting it is not enough on a stream:
 // every write moves the terminal's cursor along, so this is what the position is
@@ -405,9 +416,20 @@ static int nextByte( int waitMs )
     return getch();
 }
 
+static Boolean vioKeyWaiting();       // with the VIO section below
+static Boolean vioMouseWaiting();
+
 static Boolean anyInput()
 {
-    return gKeyPending || gMousePending || kbhit() != 0;
+    if( gKeyPending || gMousePending )
+        return True;
+    /* Two ways to ask whether anything is waiting, and they are not
+       interchangeable: conio looks at a byte stream, VIO looks at the keyboard
+       and mouse record queues.  Asking the wrong one is not an error -- it is a
+       key that never arrives. */
+    if( gVio )
+        return vioKeyWaiting() || vioMouseWaiting();
+    return kbhit() != 0;
 }
 
 static void fillKey( TEvent &event, uchar ch, uchar scan, ushort modifiers )
@@ -698,7 +720,8 @@ static int decodeEvent( TEvent &event, MouseEventType &mouse )
 
 static const ushort kVioSession = 0;
 
-static Boolean gVio = False;              // drawing with VIO rather than escapes
+// gVio itself is declared above with the screen state: the input helpers are
+// higher up in this file than the VIO code, and they have to ask it too.
 static uchar *gVioRow = 0;                // one row of cells, interleaved
 static ushort gVioRowCols = 0;
 
@@ -869,6 +892,190 @@ static void vioShowCaret( Boolean shown )
     else
         shape.attr = 0xFFFF;
     VioSetCurType( &shape, kVioSession );
+}
+
+//
+// Input under VIO: one record per key, with the modifiers in it.
+//
+
+/*
+ * Asked directly, the keyboard answers with the character, the scan code and the
+ * state of the modifier keys as one record.  conio answers with a byte, which is
+ * why the stream path carries a table of the scan code a character probably came
+ * from, waits kGapWaitMs for the tail of a key whose two halves have been seen
+ * 390 ms apart, and cannot tell Alt-F from a control character -- there is no
+ * byte that says Alt.  Both matter most in the menu bar, which is written in
+ * exactly those two things: kbAltF to open a menu, kbDownArrow to move through
+ * it.  A menu is also where a lost or duplicated key is most visible, because
+ * there is a highlighted item on the screen showing which one the application
+ * thinks is selected.
+ */
+
+/* Is a key waiting?  KbdPeek answers NO_ERROR whether or not one is, so the
+   answer is in fbStatus's top three bits -- which is the test Open Watcom's own
+   OS/2 port uses (bld/vi/os2/biosos2.c), and the one worth trusting over a
+   reading of the documentation of the day. */
+static Boolean vioKeyWaiting()
+{
+    KBDKEYINFO probe;
+
+    memset( &probe, 0, sizeof( probe ) );
+    if( KbdPeek( &probe, kVioSession ) != NO_ERROR )
+        return False;
+    return ( probe.fbStatus & 0xE0 ) != 0;
+}
+
+/* The next key, which the caller has just seen waiting, so this does not block.
+   The second argument is fWait and OS/2's 16-bit API spells true 0. */
+static BOOL vioTakeKey( TEvent &event )
+{
+    KBDKEYINFO k;
+
+    memset( &k, 0, sizeof( k ) );
+    if( KbdCharIn( &k, 0, kVioSession ) != NO_ERROR )
+        return False;
+
+    ushort modifiers = 0;
+    if( k.fsState & KBDSTF_ALT )
+        modifiers |= kbAltShift;
+    if( k.fsState & KBDSTF_CONTROL )
+        modifiers |= kbCtrlShift;
+    if( k.fsState & ( KBDSTF_LEFTSHIFT | KBDSTF_RIGHTSHIFT ) )
+        /* Mapped bit by bit rather than assigned: OS/2 spells the modifier state
+           with KBDSTF_* (shift 0x0001/0x0002, ctrl 0x0004, alt 0x0008) while
+           tvision's controlKeyState uses the Windows console values (ctrl 0x0008,
+           alt 0x0002, shift 0x0010), and copying one into the other turns Alt
+           into Shift. */
+        modifiers |= kbShift;
+
+    /* An extended key -- arrows, Home, Insert, the cursor pad -- arrives with
+       chChar holding 0xE0 as a marker and the real scan code beside it.  What
+       every view compares against is the BIOS pair with no character in it
+       (Up is 0x4800, not 0x48E0), so the marker is dropped rather than passed on
+       as a character. */
+    uchar ch = k.chChar;
+    if( ch == 0xE0 )
+        ch = 0;
+    else if( ch == 0x7F )
+        {
+        /* A client in front of the session sends DEL for Backspace and the
+           session can hand that straight through.  A keyboard at this machine
+           answers 0x08/0x0E, so this is only reached over a cable, and it is the
+           same correction the stream path makes: what the user meant is the key
+           with the left-pointing arrow on it. */
+        ch = 0x08;
+        if( k.chScan == 0 )
+            fillKey( event, ch, 0x0E, modifiers );
+        else
+            fillKey( event, ch, k.chScan, modifiers );
+        return True;
+        }
+
+    fillKey( event, ch, k.chScan, modifiers );
+    return True;
+}
+
+/*
+ * The machine's own mouse.
+ *
+ * The queue says what the mouse did, and one thing is missing from what it says:
+ * releasing a button is not an event.  A release arrives as a plain motion with
+ * no button bit set, which is why Open Watcom's own OS/2 UI reads fs & 0x06 as
+ * "button 1 is down" and never looks for the up (bld/ui/os2/c/uimous.c).  That
+ * costs nothing here: the layer above this driver turns a stream of (position,
+ * buttons held) into press, release and drag by comparing each event with the
+ * last one (TEventQueue does it, and it is what makes a click out of the two),
+ * so the driver reports what the mouse is doing now and lets that do the rest.
+ */
+static HMOU gMou = 0;
+static Boolean gMouUsable = False;
+static ushort gMouButtons = 0;            // MouGetNumButtons, for the BN2 question
+
+/* Open the mouse and ask which events to queue.  Silence is the right answer to
+   a failure: a box with no mouse driver in CONFIG.SYS is an ordinary place to run
+   this program, and there it should work with a keyboard -- which is what it
+   will do, because gMouUsable is what every other mouse entry point checks. */
+static void vioOpenMouse()
+{
+    USHORT mask = MOUSE_MOTION | MOUSE_MOTION_WITH_BN1_DOWN | MOUSE_BN1_DOWN
+                | MOUSE_MOTION_WITH_BN2_DOWN | MOUSE_BN2_DOWN
+                | MOUSE_MOTION_WITH_BN3_DOWN | MOUSE_BN3_DOWN;
+
+    if( gMouUsable )
+        return;             // getButtonCount and setUpConsole both ask
+    if( MouOpen( (PSZ) 0, &gMou ) != NO_ERROR )
+        return;
+    if( MouSetEventMask( &mask, gMou ) != NO_ERROR )
+        {
+        MouClose( gMou );
+        gMou = 0;
+        return;
+        }
+    USHORT buttons = 0;
+    if( MouGetNumButtons( &buttons, gMou ) == NO_ERROR )
+        gMouButtons = buttons;
+    gMouUsable = True;
+}
+
+static void vioCloseMouse()
+{
+    if( gMouUsable )
+        MouClose( gMou );
+    gMou = 0;
+    gMouUsable = False;
+    gMouButtons = 0;
+}
+
+static Boolean vioMouseWaiting()
+{
+    MOUQUEINFO q;
+
+    if( !gMouUsable )
+        return False;
+    if( MouGetNumQueEl( &q, gMou ) != NO_ERROR )
+        return False;
+    return q.cEvents != 0;
+}
+
+/* One event out of the queue.  MOU_NOWAIT because the caller has just been told
+   one is there, and a driver that blocks inside a poll is a frozen interface. */
+static BOOL vioTakeMouse( MouseEventType &mouse )
+{
+    MOUEVENTINFO ev;
+    USHORT wait = MOU_NOWAIT;
+
+    if( MouReadEventQue( &ev, &wait, gMou ) != NO_ERROR )
+        {
+        /* The caller asked just now whether one was there.  If the queue says yes
+           and the read says no, the two calls disagree and every poll will ask
+           again -- which is a busy loop with the interface switched off, the
+           worst of both.  Retire the mouse rather than spin on it. */
+        gMouUsable = False;
+        return False;
+        }
+
+    uchar buttons = 0;
+    if( ev.fs & ( MOUSE_BN1_DOWN | MOUSE_MOTION_WITH_BN1_DOWN ) )
+        buttons |= mbLeftButton;
+    /* What BN2 means depends on the mouse: a two-button mouse has no middle, so
+       its BN2 is the button the application calls right, and a three-button one
+       calls BN2 middle and BN3 right.  Open Watcom's UI makes the same
+       distinction for the same reason. */
+    if( ev.fs & ( MOUSE_BN2_DOWN | MOUSE_MOTION_WITH_BN2_DOWN ) )
+        buttons |= ( gMouButtons == 2 ? mbRightButton : mbMiddleButton );
+    if( ev.fs & ( MOUSE_BN3_DOWN | MOUSE_MOTION_WITH_BN3_DOWN ) )
+        buttons |= ( gMouButtons == 2 ? mbMiddleButton : mbRightButton );
+
+    ushort flags = 0;
+    if( ev.fs & ( MOUSE_MOTION | MOUSE_MOTION_WITH_BN1_DOWN
+                  | MOUSE_MOTION_WITH_BN2_DOWN | MOUSE_MOTION_WITH_BN3_DOWN ) )
+        flags = MOUSE_MOVED;
+
+    /* Row and column are the session's, zero-based, which is what tvision's
+       mouse events are too -- no scaling and no clamping, because both are
+       counting the same cells. */
+    fillMouse( mouse, (int) ev.col, (int) ev.row, buttons, flags, 0, 0 );
+    return True;
 }
 
 //
@@ -1212,6 +1419,7 @@ void THardwareInfo::setUpConsole() noexcept
         ensureShadow();
         vioClearScreen();
         rememberScreenCleared();
+        vioOpenMouse();
         // The session's cursor is where the shell left it, which is the one thing
         // this driver no longer knows until something says otherwise.
         gTermPosKnown = False;
@@ -1242,7 +1450,10 @@ void THardwareInfo::setUpConsole() noexcept
 void THardwareInfo::restoreConsole() noexcept
 {
     if( gVio )
-        vioRestoreScreen();
+        {
+        vioCloseMouse();            // stop the mouse driver touching a screen
+        vioRestoreScreen();         // that is about to belong to the shell again
+        }
     else
         {
         outStr( "\x1b[?1000l\x1b[?1002l\x1b[?1006l" );   // mouse reports off
@@ -1268,6 +1479,17 @@ void THardwareInfo::restoreConsole() noexcept
 
 DWORD THardwareInfo::getButtonCount() noexcept
 {
+    if( gVio )
+        {
+        /* The answer decides whether tvision bothers with the mouse at all, so
+           this is where the mouse is opened: waiting for setUpConsole would ask
+           the question before there was a mouse to answer with. */
+        if( !gMouUsable )
+            vioOpenMouse();
+        if( !gMouUsable )
+            return 0;               // no mouse driver in this session
+        return gMouButtons != 0 ? (DWORD) gMouButtons : 3;
+        }
     /* There is no way to ask a stream, and the answer only decides whether
        tvision bothers to enable mouse reporting -- which a terminal without a
        mouse will ignore just as it ignores the rest.  Three is the safe claim. */
@@ -1303,6 +1525,12 @@ BOOL THardwareInfo::getMouseEvent( MouseEventType& event ) noexcept
         gMousePending = False;
         return True;
         }
+    if( gVio )
+        {
+        if( vioMouseWaiting() )
+            return vioTakeMouse( event );
+        return False;
+        }
     if( gKeyPending || !kbhit() )
         return False;
 
@@ -1328,6 +1556,18 @@ BOOL THardwareInfo::getKeyEvent( TEvent& event ) noexcept
         {
         event = gPendingKey;
         gKeyPending = False;
+        }
+    else if( gVio )
+        {
+        if( gMousePending || !vioKeyWaiting() )
+            return False;
+        /* One record, one key: no gap to wait for and no half of a key to lose,
+           which is the difference between a menu that follows the arrow keys and
+           one that highlights the item below the item that was pressed. */
+        if( !vioTakeKey( event ) )
+            return False;
+        if( event.keyDown.keyCode == kbNoKey )
+            return False;   // a key with no name, dropped as below
         }
     else
         {
