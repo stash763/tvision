@@ -151,6 +151,104 @@ static ushort gRows = kDefRows;
 static ushort gCaretX = 0;
 static ushort gCaretY = 0;
 
+// Whether the terminal was last told to show the caret.  -1 is "not yet told", so
+// the first cursorOn() or cursorOff() is never swallowed.
+static int gCaretShown = -1;
+
+// Where the terminal's own cursor was last addressed, and whether that is still
+// where it is: writing text moves it along by itself, which is what the flag below
+// records.  Seven bytes per caret placement, twenty times a second, is the second
+// most expensive thing this driver used to do.
+static ushort gTermX = 0;
+static ushort gTermY = 0;
+static Boolean gTermPosKnown = False;
+
+/* The shadow of the terminal: what we believe the screen at the other end of the
+   pipe is holding, one character and one attribute per cell.
+
+   The classic writer does not diff.  Every cell a view draws reaches
+   THardwareInfo::screenWrite() (tvwrite.cpp calls it for the run whether or not the
+   cell changed), so a driver that forwards whatever it is handed turns a repaint
+   into output.  Measured on eComStation with atui sitting at an idle prompt: 6.2 KB
+   per second and 25 repaints per second of the two rows of the input panel, because
+   the application redraws them on a 50 ms timer and each of those redraws was 160
+   characters of output.  On a 486 over telnet that is not invisible: the separator
+   visibly flickers, and the loop doing it is the same loop that reads the keyboard.
+
+   Remembering what the terminal holds makes a repaint cost what changed instead of
+   what was drawn, which is what every modern driver in this library does on the
+   platforms that have one.
+
+   An attribute of 0xFF with a character of 0 means "nothing that matches this has
+   ever been written here", and no real cell can collide with it because
+   printableCell() never sends a NUL.  An unknown cell is therefore always sent rather
+   than always suppressed -- the one direction this can be wrong in that costs bytes
+   rather than pixels.  It is also what a screen the driver did not clear itself
+   starts as, which is the honest answer to a terminal this process cannot see. */
+static uchar *gShadowCh = 0;
+static uchar *gShadowAttr = 0;
+static ushort gShadowCols = 0;
+static ushort gShadowRows = 0;
+
+static size_t shadowCells()
+{
+    return (size_t) gShadowCols * gShadowRows;
+}
+
+/* Drop the shadow, so that the next write of any cell goes out whatever it holds. */
+static void forgetScreen()
+{
+    if( gShadowCh == 0 )
+        return;
+    memset( gShadowCh, 0, shadowCells() );
+    memset( gShadowAttr, 0xFF, shadowCells() );
+}
+
+/* A VT clear really does leave the terminal holding spaces in its default colours,
+   and our model of the default attribute is kDefaultAttr, so this is not a guess:
+   it is exactly what the escape we have just sent did. */
+static void rememberScreenCleared()
+{
+    if( gShadowCh == 0 )
+        return;
+    memset( gShadowCh, ' ', shadowCells() );
+    memset( gShadowAttr, kDefaultAttr, shadowCells() );
+}
+
+/* The shadow has to be as big as the screen, and the screen is not known until the
+   constructor has read the environment.  Called before every write rather than at
+   startup because the size can also change under setScreenMode. */
+static Boolean ensureShadow()
+{
+    if( gShadowCh != 0 && gShadowCols == gCols && gShadowRows == gRows )
+        return True;
+
+    delete[] gShadowCh;
+    delete[] gShadowAttr;
+    gShadowCh = new uchar[(size_t) gCols * gRows];
+    gShadowAttr = new uchar[(size_t) gCols * gRows];
+    gShadowCols = gCols;
+    gShadowRows = gRows;
+    if( gShadowCh == 0 || gShadowAttr == 0 )
+        return False;
+    forgetScreen();
+    return True;
+}
+
+static Boolean cellIsCurrent( ushort x, ushort y, const CHAR_INFO &cell )
+{
+    const size_t at = (size_t) y * gShadowCols + x;
+    return gShadowCh[at] == (uchar) cell.Char.AsciiChar
+        && gShadowAttr[at] == (uchar) ( cell.Attributes & 0xFF );
+}
+
+static void rememberCell( ushort x, ushort y, const CHAR_INFO &cell )
+{
+    const size_t at = (size_t) y * gShadowCols + x;
+    gShadowCh[at] = (uchar) cell.Char.AsciiChar;
+    gShadowAttr[at] = (uchar) ( cell.Attributes & 0xFF );
+}
+
 // One decoded event that the other half of the polling pair has not collected.
 // getKeyEvent and getMouseEvent share one byte stream, so whichever of them gets
 // a byte belonging to the other has to hold on to it: the queue polls both and
@@ -176,6 +274,9 @@ static void moveTo( ushort x, ushort y )
     char seq[24];
     sprintf( seq, "\x1b[%u;%uH", (unsigned) y + 1, (unsigned) x + 1 );
     outStr( seq );
+    gTermX = x;
+    gTermY = y;
+    gTermPosKnown = True;
 }
 
 /* The legacy colour model is one BIOS attribute byte, which is eight foreground
@@ -611,7 +712,15 @@ void THardwareInfo::setCaretSize( ushort size ) noexcept
     crInfo.bVisible = (size != 0) ? True : False;
     // A size of 0 is the classic driver's way of saying "hide it", matching the
     // Windows console's own treatment of a zero-height cursor.
-    outStr( size != 0 ? "\x1b[?25h" : "\x1b[?25l" );
+    //
+    // Only sent when it changes: tvision places the caret on every pass over the
+    // screen, and this is called each time, so an unconditional escape is three bytes
+    // per pass for a terminal that is already in the state being asked for.
+    const int shown = (size != 0) ? 1 : 0;
+    if( gCaretShown == shown )
+        return;
+    gCaretShown = shown;
+    outStr( shown ? "\x1b[?25h" : "\x1b[?25l" );
 }
 
 void THardwareInfo::setCaretPosition( ushort x, ushort y ) noexcept
@@ -620,7 +729,11 @@ void THardwareInfo::setCaretPosition( ushort x, ushort y ) noexcept
     gCaretY = y;
     sbInfo.dwCursorPosition.X = (SHORT) x;
     sbInfo.dwCursorPosition.Y = (SHORT) y;
-    moveTo( x, y );
+    // The same argument as above, in cursor addresses: a caret that has not moved
+    // does not need to be told where it is, and after any write to the screen the
+    // terminal's cursor is wherever that write left it (so this has to say so).
+    if( !gTermPosKnown || gTermX != x || gTermY != y )
+        moveTo( x, y );
 }
 
 //
@@ -659,6 +772,11 @@ void THardwareInfo::setScreenMode( ushort mode ) noexcept
     outStr( seq );
 
     gAttr = -1;
+    // A resized terminal is a screen whose contents nobody can predict -- what is
+    // kept, what is cleared and what scrolls is the emulator's choice -- so nothing
+    // may be skipped on the strength of what was there before.
+    ensureShadow();
+    forgetScreen();
     flushScreen();
 }
 
@@ -667,16 +785,21 @@ void THardwareInfo::clearScreen( ushort, ushort ) noexcept
     // A VT clear is the whole screen, so the extent asked for is not used.
     outStr( "\x1b[0m\x1b[2J\x1b[H" );
     gAttr = -1;
+    gTermX = 0;
+    gTermY = 0;
+    gTermPosKnown = True;         // the \x1b[H above is what makes that true
+    rememberScreenCleared();
 }
 
 void THardwareInfo::flushScreen() noexcept
 {
-    // The writes have moved the terminal's cursor along from wherever the
-    // application put it, and it stays there; putting it back is what makes the
-    // difference between a caret and a stray block.
-    char seq[24];
-    sprintf( seq, "\x1b[%u;%uH", (unsigned) gCaretY + 1, (unsigned) gCaretX + 1 );
-    outStr( seq );
+    // The writes have moved the terminal's cursor along from wherever the application
+    // put it, and it stays there; putting it back is what makes the difference between a
+    // caret and a stray block.  Which is also why it can be skipped: nothing has been
+    // written since the last time the caret was addressed, the flag says, then the
+    // terminal is already showing it and 8 bytes on the wire buy nothing.
+    if( !gTermPosKnown || gTermX != gCaretX || gTermY != gCaretY )
+        moveTo( gCaretX, gCaretY );
     fflush( stdout );
 }
 
@@ -684,29 +807,65 @@ void THardwareInfo::flushScreen() noexcept
    that the run always stays inside one row, so a sequence per call is enough.
    Writing the last column of the last row leaves an emulated terminal in its
    pending-wrap state, which the next escape clears -- flushScreen() emits one, so
-   a full-screen redraw does not scroll the screen away underneath the program. */
+   a full-screen redraw does not scroll the screen away underneath the program.
+
+   Only cells the terminal does not already hold are sent, and one cursor address is
+   emitted per run of those rather than per cell: a screen that is redrawn unchanged
+   costs nothing, and a screen with one character in it costs that character.  See
+   the shadow above for why this driver cannot assume that being told to draw a cell
+   means the terminal needs to hear about it. */
 void THardwareInfo::screenWrite( ushort x, ushort y, CHAR_INFO *buf, DWORD len ) noexcept
 {
     if( len == 0 )
         return;
-
-    moveTo( x, y );
+    if( !ensureShadow() )
+        return;                     // no memory for the shadow: draw nothing rather
+                                    // than draw the wrong thing and lose the diff
+    if( x >= gCols || y >= gRows )
+        return;
+    if( (DWORD) ( gCols - x ) < len )
+        len = (DWORD) ( gCols - x );
 
     DWORD i = 0;
     while( i < len )
         {
-        int attr = buf[i].Attributes & 0xFF;
-        selectAttr( attr );
+        // Cells the terminal already has are passed over, and the cursor is
+        // addressed again when something after them has to be sent.
+        if( cellIsCurrent( (ushort) ( x + i ), y, buf[i] ) )
+            {
+            ++i;
+            continue;
+            }
 
-        // One write per run of the same attribute rather than per cell: a line of
-        // a window is usually one attribute long, and every byte here travels to
-        // the other end of a telnet connection.
-        char run[128];
-        size_t n = 0;
-        while( i < len && (buf[i].Attributes & 0xFF) == attr && n < sizeof( run ) - 1 )
-            run[n++] = printableCell( (unsigned char) buf[i++].Char.AsciiChar );
-        run[n] = '\0';
-        outStr( run );
+        const DWORD first = i;
+        while( i < len && !cellIsCurrent( (ushort) ( x + i ), y, buf[i] ) )
+            ++i;
+
+        moveTo( (ushort) ( x + first ), y );
+
+        DWORD at = first;
+        while( at < i )
+            {
+            int attr = buf[at].Attributes & 0xFF;
+            selectAttr( attr );
+
+            // One write per run of the same attribute rather than per cell: a line of
+            // a window is usually one attribute long, and every byte here travels to
+            // the other end of a telnet connection.
+            char run[128];
+            size_t n = 0;
+            while( at < i && (buf[at].Attributes & 0xFF) == attr && n < sizeof( run ) - 1 )
+                {
+                run[n++] = printableCell( (unsigned char) buf[at].Char.AsciiChar );
+                rememberCell( (ushort) ( x + at ), y, buf[at] );
+                ++at;
+                }
+            run[n] = '\0';
+            outStr( run );
+            // The terminal's cursor is now after the run, not where it was addressed
+            // to, and only the next moveTo can claim to know where it is.
+            gTermPosKnown = False;
+            }
         }
 }
 
@@ -732,6 +891,16 @@ void THardwareInfo::setUpConsole() noexcept
     gAttr = -1;
     gCaretX = 0;
     gCaretY = 0;
+    gTermX = 0;
+    gTermY = 0;
+    gTermPosKnown = True;
+    gCaretShown = -1;             // the alternate screen's caret is not known to us
+    // The shadow starts here rather than in the constructor because this is where the
+    // screen is known: the size has been read from the environment by now, and the
+    // alternate screen we have just asked for is genuinely cleared, so holding spaces
+    // in the default attribute is a statement about the escape above and not a hope.
+    ensureShadow();
+    rememberScreenCleared();
     fflush( stdout );
 }
 
@@ -742,6 +911,13 @@ void THardwareInfo::restoreConsole() noexcept
     outStr( "\x1b[H\x1b[J" );                        // and a clean screen under it
     outStr( "\x1b[?1049l" );
     gAttr = -1;
+    gCaretShown = 1;              // the \x1b[?25h above is what the terminal now has
+    delete[] gShadowCh;
+    delete[] gShadowAttr;
+    gShadowCh = 0;
+    gShadowAttr = 0;
+    gShadowCols = 0;
+    gShadowRows = 0;
     fflush( stdout );
 }
 
