@@ -231,6 +231,36 @@ static size_t shadowCells()
     return (size_t) gShadowCols * gShadowRows;
 }
 
+/* Cells that have been drawn and are not on the screen yet -- one byte each, and a
+   count so that the flush of a screen with nothing to send is one integer test.
+
+   Why this exists is that the classic writer draws a view by filling it with
+   background and writing the text over it: TView::drawView() -> the view's draw()
+   -> writeChar(' ', ..., whole row) -> writeStr().  Sent as they are made, those
+   are two states on the screen for every repaint, and the one in between is blank.
+   Streaming an answer therefore flashes the whole response area once per
+   character, which is what it did on the box's own screen (reported as flicker)
+   and, at 2 KB of wire per row on top of it, over telnet too.
+
+   Holding the writes until the application goes looking for an event collapses
+   fill-and-text back into one state: what reaches the screen is the difference
+   between the last frame and this one, which is also all it ever costs.
+   `source/platform/hardware.cpp` does exactly this on the platforms with a modern
+   driver -- "flush the screen once for every time all events have been processed,
+   only when blocking for events" -- and this driver is doing the same for the
+   same reason. */
+static uchar *gDirty = 0;
+static size_t gDirtyCount = 0;
+
+/* Nothing outstanding: the screen holds what the shadow says, either because it
+   always did or because whatever it held has just been painted over. */
+static void forgetPending()
+{
+    if( gDirty != 0 )
+        memset( gDirty, 0, shadowCells() );
+    gDirtyCount = 0;
+}
+
 /* Drop the shadow, so that the next write of any cell goes out whatever it holds. */
 static void forgetScreen()
 {
@@ -238,6 +268,7 @@ static void forgetScreen()
         return;
     memset( gShadowCh, 0, shadowCells() );
     memset( gShadowAttr, 0xFF, shadowCells() );
+    forgetPending();
 }
 
 /* A VT clear really does leave the terminal holding spaces in its default colours,
@@ -249,6 +280,7 @@ static void rememberScreenCleared()
         return;
     memset( gShadowCh, ' ', shadowCells() );
     memset( gShadowAttr, kDefaultAttr, shadowCells() );
+    forgetPending();                // the clear covers whatever was waiting
 }
 
 /* The shadow has to be as big as the screen, and the screen is not known until the
@@ -261,11 +293,13 @@ static Boolean ensureShadow()
 
     delete[] gShadowCh;
     delete[] gShadowAttr;
+    delete[] gDirty;
     gShadowCh = new uchar[(size_t) gCols * gRows];
     gShadowAttr = new uchar[(size_t) gCols * gRows];
+    gDirty = new uchar[(size_t) gCols * gRows];
     gShadowCols = gCols;
     gShadowRows = gRows;
-    if( gShadowCh == 0 || gShadowAttr == 0 )
+    if( gShadowCh == 0 || gShadowAttr == 0 || gDirty == 0 )
         return False;
     forgetScreen();
     return True;
@@ -281,6 +315,11 @@ static Boolean cellIsCurrent( ushort x, ushort y, const CHAR_INFO &cell )
 static void rememberCell( ushort x, ushort y, const CHAR_INFO &cell )
 {
     const size_t at = (size_t) y * gShadowCols + x;
+    if( !gDirty[ at ] )
+        {
+        gDirty[ at ] = 1;
+        ++gDirtyCount;
+        }
     gShadowCh[at] = (uchar) cell.Char.AsciiChar;
     gShadowAttr[at] = (uchar) ( cell.Attributes & 0xFF );
 }
@@ -770,23 +809,6 @@ static Boolean vioOpen()
     gRows = mode.row;                 // counts, not last index: see above
     gCols = mode.col;
     return vioEnsureRow();
-}
-
-/* A run of cells at the place the classic writer worked out for them.  Written
-   raw: unlike a stream there is nothing here that a control byte could be
-   mistaken for, and writing what the cell holds keeps the shadow an exact account
-   of the screen rather than an approximation of it. */
-static void vioWriteRun( ushort x, ushort y, const CHAR_INFO *buf, ushort len )
-{
-    if( !vioEnsureRow() || len == 0 || len > gVioRowCols || x + len > gVioRowCols )
-        return;
-
-    for( ushort i = 0; i < len; ++i )
-        {
-        gVioRow[ i * 2 ]     = (uchar) buf[i].Char.AsciiChar;
-        gVioRow[ i * 2 + 1 ] = (uchar) ( buf[i].Attributes & 0xFF );
-        }
-    VioWrtCellStr( (PCH) gVioRow, (USHORT) ( len * 2 ), y, x, kVioSession );
 }
 
 static void vioClearScreen()
@@ -1294,18 +1316,104 @@ void THardwareInfo::clearScreen( ushort, ushort ) noexcept
     rememberScreenCleared();
 }
 
+/* Send what has been drawn and not yet sent, as few times as the screen will take.
+   This is the only place either back end writes cells, which is what makes a
+   repaint cost what changed rather than what was drawn -- and what makes a repaint
+   that changed nothing cost nothing at all, the idle screen sitting at 0 bytes a
+   second with the application redrawing itself twenty times a second.
+
+   The runs are cut out of the shadow, not out of anything the caller handed over:
+   the shadow holds the *last* word for each cell, and a cell written twice in one
+   frame is sent once, with the value it ended on.  That is the whole of the
+   anti-flicker argument -- the fill with background that every view's draw() starts
+   with never reaches the screen unless it is still there when the frame ends. */
+static void flushCells()
+{
+    if( gDirty == 0 || gDirtyCount == 0 )
+        return;
+
+    if( gShadowCols != gCols || gShadowRows != gRows )
+        {
+        // A screen that changed size under a frame that was drawn for the old one.
+        // setScreenMode drops the shadow for the same reason: nobody knows what the
+        // new screen holds, so nothing may be written on the strength of that.
+        forgetPending();
+        return;
+        }
+
+    for( ushort y = 0; y < gShadowRows; ++y )
+        {
+        const size_t row = (size_t) y * gShadowCols;
+        ushort x = 0;
+        while( x < gShadowCols )
+            {
+            if( !gDirty[ row + x ] )
+                {
+                ++x;
+                continue;
+                }
+            const ushort first = x;
+            while( x < gShadowCols && gDirty[ row + x ] )
+                ++x;
+            const ushort len = (ushort) ( x - first );
+
+            if( gVio )
+                {
+                if( vioEnsureRow() )
+                    {
+                    for( ushort v = 0; v < len; ++v )
+                        {
+                        gVioRow[ v * 2 ]     = gShadowCh[ row + first + v ];
+                        gVioRow[ v * 2 + 1 ] = gShadowAttr[ row + first + v ];
+                        }
+                    VioWrtCellStr( (PCH) gVioRow, (USHORT) ( len * 2 ), y, first,
+                                   kVioSession );
+                    }
+                continue;
+                }
+
+            /* A stream: one address for the run, then one escape per change of
+               colour.  A run across a row is normally one colour throughout, so the
+               inner loop is normally entered once. */
+            moveTo( first, y );
+            ushort v = first;
+            while( v < x )
+                {
+                const uchar attr = gShadowAttr[ row + v ];
+                selectAttr( attr );
+
+                char text[ 128 ];
+                size_t n = 0;
+                while( v < x && gShadowAttr[ row + v ] == attr
+                       && n < sizeof( text ) - 1 )
+                    text[ n++ ] = printableCell( gShadowCh[ row + v ] );
+                text[ n ] = '\0';
+                outStr( text );
+                v += (ushort) n;
+                }
+            // The terminal's cursor is after what was just written, not where it was
+            // addressed to, and only the next moveTo can claim to know where it is.
+            gTermPosKnown = False;
+            }
+        }
+
+    forgetPending();
+}
+
 void THardwareInfo::flushScreen() noexcept
 {
     if( gVio )
         {
-        /* Cell writes go to the screen as they are made and leave the cursor
-           where it was, so there is nothing to push and no caret to put back --
-           the pending-wrap problem this call exists for on a stream is a thing a
-           screen buffer does not have.  stdout is flushed because the application
-           may have written a line of its own to it, and that does need moving. */
+        /* Cell writes go to the screen in runs at flush time and leave the cursor
+           where it was, so there is nothing else to put back -- the pending-wrap
+           problem this call exists for on a stream is a thing a screen buffer does
+           not have.  stdout is flushed because the application may have written a
+           line of its own to it, and that does need moving. */
+        flushCells();
         fflush( stdout );
         return;
         }
+    flushCells();
     // The writes have moved the terminal's cursor along from wherever the application
     // put it, and it stays there; putting it back is what makes the difference between a
     // caret and a stray block.  Which is also why it can be skipped: nothing has been
@@ -1316,17 +1424,16 @@ void THardwareInfo::flushScreen() noexcept
     fflush( stdout );
 }
 
-/* One row of cells, at the position the classic writer computed for them.  Note
-   that the run always stays inside one row, so a sequence per call is enough.
-   Writing the last column of the last row leaves an emulated terminal in its
-   pending-wrap state, which the next escape clears -- flushScreen() emits one, so
-   a full-screen redraw does not scroll the screen away underneath the program.
+/* One row of cells, at the position the classic writer computed for them.  The run
+   always stays inside one row, so one dirty range is enough.
 
-   Only cells the terminal does not already hold are sent, and one cursor address is
-   emitted per run of those rather than per cell: a screen that is redrawn unchanged
-   costs nothing, and a screen with one character in it costs that character.  See
-   the shadow above for why this driver cannot assume that being told to draw a cell
-   means the terminal needs to hear about it. */
+   Nothing is sent from here.  The cells are copied into the shadow, which is what
+   marks them as owing a write, and flushScreen() puts them on the screen -- once per
+   turn of the event loop, just before that loop blocks for input.  A view draws
+   itself by filling its rows with background and writing the text over the fill, and
+   a screen told both shows the blank in between: that was the response area flashing
+   once for every character of an answer.  See the dirty map above, and
+   source/platform/hardware.cpp, which defers for the same reason. */
 void THardwareInfo::screenWrite( ushort x, ushort y, CHAR_INFO *buf, DWORD len ) noexcept
 {
     if( len == 0 )
@@ -1339,59 +1446,9 @@ void THardwareInfo::screenWrite( ushort x, ushort y, CHAR_INFO *buf, DWORD len )
     if( (DWORD) ( gCols - x ) < len )
         len = (DWORD) ( gCols - x );
 
-    DWORD i = 0;
-    while( i < len )
-        {
-        // Cells the terminal already has are passed over, and the cursor is
-        // addressed again when something after them has to be sent.
-        if( cellIsCurrent( (ushort) ( x + i ), y, buf[i] ) )
-            {
-            ++i;
-            continue;
-            }
-
-        const DWORD first = i;
-        while( i < len && !cellIsCurrent( (ushort) ( x + i ), y, buf[i] ) )
-            ++i;
-
-        if( gVio )
-            {
-            /* One call for the whole run: a cell write carries its own attribute,
-               so the attribute grouping the stream path does below -- one escape
-               per run of like colours -- buys nothing here. */
-            for( DWORD v = first; v < i; ++v )
-                rememberCell( (ushort) ( x + v ), y, buf[v] );
-            vioWriteRun( (ushort) ( x + first ), y, &buf[first],
-                         (ushort) ( i - first ) );
-            continue;
-            }
-
-        moveTo( (ushort) ( x + first ), y );
-
-        DWORD at = first;
-        while( at < i )
-            {
-            int attr = buf[at].Attributes & 0xFF;
-            selectAttr( attr );
-
-            // One write per run of the same attribute rather than per cell: a line of
-            // a window is usually one attribute long, and every byte here travels to
-            // the other end of a telnet connection.
-            char run[128];
-            size_t n = 0;
-            while( at < i && (buf[at].Attributes & 0xFF) == attr && n < sizeof( run ) - 1 )
-                {
-                run[n++] = printableCell( (unsigned char) buf[at].Char.AsciiChar );
-                rememberCell( (ushort) ( x + at ), y, buf[at] );
-                ++at;
-                }
-            run[n] = '\0';
-            outStr( run );
-            // The terminal's cursor is now after the run, not where it was addressed
-            // to, and only the next moveTo can claim to know where it is.
-            gTermPosKnown = False;
-            }
-        }
+    for( DWORD i = 0; i < len; ++i )
+        if( !cellIsCurrent( (ushort) ( x + i ), y, buf[i] ) )
+            rememberCell( (ushort) ( x + i ), y, buf[i] );
 }
 
 TScreenCell *THardwareInfo::allocateScreenBuffer() noexcept
@@ -1466,8 +1523,11 @@ void THardwareInfo::restoreConsole() noexcept
 
     delete[] gShadowCh;
     delete[] gShadowAttr;
-    gShadowCh = 0;
+    delete[] gDirty;                // with the shadow it described: nothing is
+    gShadowCh = 0;                  // pending on a screen being handed back
     gShadowAttr = 0;
+    gDirty = 0;
+    gDirtyCount = 0;
     gShadowCols = 0;
     gShadowRows = 0;
     fflush( stdout );
@@ -1604,6 +1664,15 @@ BOOL THardwareInfo::getKeyEvent( TEvent& event ) noexcept
 
 void THardwareInfo::waitForEvents( int timeoutMs ) noexcept
 {
+    /* The frame ends here.  Everything drawn since the last time through the event
+       loop goes to the screen now, in one pass, which is what keeps a view's
+       fill-then-write from being seen as two states -- and it is free to be here
+       rather than in screenWrite because nothing can look at the screen while the
+       application is standing in this function.  `source/platform/hardware.cpp`
+       does the same, with the same reason: flush once for every time all the events
+       have been processed, only when blocking for events. */
+    flushScreen();
+
 #ifdef TV_DEBUG_LOOP
     const uint64_t t0 = THardwareInfo::getTickCountMs();
     if( anyInput() )
