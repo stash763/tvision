@@ -78,6 +78,12 @@ public:
     static void setScreenMode( ushort mode ) noexcept;
     static void clearScreen( ushort w, ushort h ) noexcept;
     static void flushScreen() noexcept;
+/* Write the whole screen again, whether or not anything changed.  For the moments
+   where the screen and the application's picture of it are allowed to have come
+   apart: something wrote to the terminal that we did not see, or a box was drawn
+   over the desktop and taken away.  What goes out is what the application last
+   drew, so this is a repair and not a clear. */
+    static void redrawScreen() noexcept;
 /* Two spellings of the same call, not two different calls: the legacy build hands
    the driver an array of two-byte cells, which is what a CHAR_INFO is made of
    (compat/windows/windows.h defines the type for every compiler that has no

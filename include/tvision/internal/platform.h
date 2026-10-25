@@ -132,6 +132,8 @@ public:
     void screenWrite(int x, int y, TScreenCell *b, int l) noexcept { displayBuf.screenWrite(x, y, b, l); }
     void flushScreen() noexcept
         { console.lock([&] (auto *c) { displayBuf.flushScreen(c->display); }); }
+    void redrawScreen() noexcept
+        { console.lock([&] (auto *c) { displayBuf.redrawScreen(c->display); }); }
     TScreenCell *reloadScreenInfo() noexcept
         { return console.lock([&] (auto *c) { return displayBuf.reloadScreenInfo(c->display); }); }
     void freeScreenBuffer() noexcept { displayBuf.reset(); }

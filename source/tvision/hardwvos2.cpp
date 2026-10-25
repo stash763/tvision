@@ -1424,6 +1424,36 @@ void THardwareInfo::flushScreen() noexcept
     fflush( stdout );
 }
 
+/* Write the whole screen again.
+ *
+   Everything else in this file sends what changed; this sends what the application
+   drew whether or not it changed.  It is for the moments where the two are allowed
+   to have come apart -- a box drawn over the desktop and taken away again, a
+   session that redrew itself behind us, a program that used the screen between two
+   of our writes.  The shadow is the application's own picture, so dirtying every
+   cell and flushing puts that picture back; it is a repair, not a clear, and the
+   difference matters because a clear shows a blank screen where the application
+   has already drawn.
+ *
+   One full screen of cells goes out -- about 2 KB of cells on an 80x25 session,
+   more on a big one -- which is why this is called at a dialog's two transitions
+   and not from the frame loop. */
+void THardwareInfo::redrawScreen() noexcept
+{
+    if( gDirty == 0 || gShadowCols != gCols || gShadowRows != gRows )
+        {
+        // Either there is no shadow yet or it is not the screen's size, in which
+        // case its cells are not anyone's picture of anything and writing them
+        // would put garbage on the screen.  flushScreen() refuses a mismatched
+        // shadow for the same reason.
+        return;
+        }
+    memset( gDirty, 1, shadowCells() );
+    gDirtyCount = shadowCells();
+    flushCells();
+    fflush( stdout );
+}
+
 /* One row of cells, at the position the classic writer computed for them.  The run
    always stays inside one row, so one dirty range is enough.
 
