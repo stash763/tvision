@@ -252,6 +252,32 @@ static size_t shadowCells()
 static uchar *gDirty = 0;
 static size_t gDirtyCount = 0;
 
+/* What the screen held at the end of the last flush, and whether that is a
+   statement anyone can make -- only VIO fills it in, and only the flush does.
+   It exists to recognise one frame shape: the last frame shifted up by a few
+   rows, which is what every scrolled transcript is, and which the flush can
+   hand to the hardware as one VioScrollUp instead of one VioWrtCellStr per
+   row.  Measured (local.trc / local2.trc, TESTING.md): while an answer
+   follows, the session spends more time inside the VIO write path than the
+   application spends in all of its own code -- at 25 rows that is ~25 calls
+   per frame, eight frames a second, and on the box each call costs the
+   Presentation Manager machinery that mirrors it, not the bytes carried. */
+static uchar *gPrevCh = 0;
+static uchar *gPrevAttr = 0;
+static Boolean gPrevValid = False;
+
+/* Counting the expensive calls for the application's once-a-second log: how
+   many writes went out, and how many frames a scroll replaced them with. */
+static unsigned long gVioCalls = 0;
+static unsigned long gVioScrolls = 0;
+
+/* What the last frame cost to send, in milliseconds -- the number that tells
+   the application's repaint interval how much a frame is worth on this
+   machine.  A P4 spends a few on a scrolled frame; a 486 spends tens, and an
+   interval that is right for one should not be asked of the other.  ftime()
+   resolution is the same clock the driver's input waits already use. */
+static unsigned long gVioFlushMs = 0;
+
 /* Nothing outstanding: the screen holds what the shadow says, either because it
    always did or because whatever it held has just been painted over. */
 static void forgetPending()
@@ -268,6 +294,7 @@ static void forgetScreen()
         return;
     memset( gShadowCh, 0, shadowCells() );
     memset( gShadowAttr, 0xFF, shadowCells() );
+    gPrevValid = False;             // what the screen holds is now nobody's guess
     forgetPending();
 }
 
@@ -280,6 +307,14 @@ static void rememberScreenCleared()
         return;
     memset( gShadowCh, ' ', shadowCells() );
     memset( gShadowAttr, kDefaultAttr, shadowCells() );
+    if( gPrevCh != 0 )
+        {
+        // The screen holds exactly what the shadow now says -- so the shadow
+        // of this moment is also an honest previous frame.
+        memcpy( gPrevCh, gShadowCh, shadowCells() );
+        memcpy( gPrevAttr, gShadowAttr, shadowCells() );
+        gPrevValid = True;
+        }
     forgetPending();                // the clear covers whatever was waiting
 }
 
@@ -294,12 +329,18 @@ static Boolean ensureShadow()
     delete[] gShadowCh;
     delete[] gShadowAttr;
     delete[] gDirty;
+    delete[] gPrevCh;
+    delete[] gPrevAttr;
     gShadowCh = new uchar[(size_t) gCols * gRows];
     gShadowAttr = new uchar[(size_t) gCols * gRows];
     gDirty = new uchar[(size_t) gCols * gRows];
+    gPrevCh = new uchar[(size_t) gCols * gRows];
+    gPrevAttr = new uchar[(size_t) gCols * gRows];
     gShadowCols = gCols;
     gShadowRows = gRows;
-    if( gShadowCh == 0 || gShadowAttr == 0 || gDirty == 0 )
+    gPrevValid = False;
+    if( gShadowCh == 0 || gShadowAttr == 0 || gDirty == 0
+        || gPrevCh == 0 || gPrevAttr == 0 )
         return False;
     forgetScreen();
     return True;
@@ -1316,6 +1357,113 @@ void THardwareInfo::clearScreen( ushort, ushort ) noexcept
     rememberScreenCleared();
 }
 
+/* One row of a frame against one row of another: characters and colours. */
+static Boolean framesRowMatch( const uchar *chA, const uchar *atA, size_t rowA,
+                               const uchar *chB, const uchar *atB, size_t rowB )
+{
+    const size_t a = rowA * gShadowCols, b = rowB * gShadowCols;
+    return memcmp( chA + a, chB + b, gShadowCols ) == 0
+        && memcmp( atA + a, atB + b, gShadowCols ) == 0;
+}
+
+static void clearRowDirty( ushort y )
+{
+    size_t at = (size_t) y * gShadowCols, end = at + gShadowCols;
+    for( ; at != end; ++at )
+        if( gDirty[at] ) { gDirty[at] = 0; --gDirtyCount; }
+}
+
+static void markRowDirty( ushort y )
+{
+    size_t at = (size_t) y * gShadowCols, end = at + gShadowCols;
+    for( ; at != end; ++at )
+        if( !gDirty[at] ) { gDirty[at] = 1; ++gDirtyCount; }
+}
+
+/* The frame shape every scrolled transcript makes: the screen as it was,
+   shifted up by k rows, with the new text at the bottom of the scrolled
+   region.  Written run by run that is one VioWrtCellStr per row of the
+   region; asked of the hardware it is one VioScrollUp and the k new rows --
+   and on the local screen the call itself, not the bytes, is what costs: the
+   session mirrors every write (local2.trc: the kernel display path was 43% of
+   the UI thread while an answer scrolled, with the application itself under
+   2%; see TESTING.md).
+
+   The rule is deliberately narrow.  From the first dirty row down, every row
+   of the chosen window must equal the previous frame's row k below it -- that
+   is what the scroll will deliver -- and the k rows the scroll leaves exposed
+   are marked dirty in full, so the run loop below rewrites every one of them
+   from the shadow.  Changes that are not a shift sit outside the window or
+   break the match, and the frame goes out the ordinary way.  A shift that
+   matches on blank rows and costs a few blank writes is wrong about nothing:
+   the screen ends with the shadow either way. */
+static Boolean rowIsDirty( ushort y )
+{
+    const size_t at = (size_t) y * gShadowCols;
+    for( ushort x = 0; x < gShadowCols; ++x )
+        if( gDirty[ at + x ] )
+            return True;
+    return False;
+}
+
+/* Can this frame be delivered as one scroll up from `first`?  The window ends
+   where the matching does, so whatever else the frame changed below it sits
+   outside and goes out as written rows.  The few blank rows a greedy match
+   folds in at the bottom cost a scroll and k blank writes and are wrong about
+   nothing: the screen ends holding the shadow either way. */
+static Boolean vioScrollFrom( ushort first )
+{
+    for( ushort k = 1; k <= 8; ++k )
+        {
+        /* Rows [first .. first+len-1] shift; rows [first+len .. first+len+k-1]
+           are what the scroll exposes.  Stopping the shift at `limit` keeps
+           every shifted row inside the previous frame. */
+        const ushort limit = (ushort) ( gShadowRows - k );
+        ushort len = 0;
+        while( first + len < limit
+               && framesRowMatch( gShadowCh, gShadowAttr, first + len,
+                                  gPrevCh, gPrevAttr, first + len + k ) )
+            ++len;
+        if( len < 3 )
+            continue;
+
+        const ushort bottom = (ushort) ( first + len + k - 1 );
+        //  bsesub.h: VioScrollUp( top, left, bottom, right, lines, pAttrFill,
+        //          session ) -- the exposed rows take no fill attribute, the
+        //          flush writes every cell of them from the shadow right after.
+        if( VioScrollUp( first, 0, bottom, (ushort) ( gShadowCols - 1 ),
+                         k, 0, kVioSession ) != NO_ERROR )
+            return False;           // no scroll, and so no writes either way
+        ++gVioScrolls;
+        for( ushort y = first; y < first + len; ++y )
+            clearRowDirty( y );     // delivered by the scroll
+        for( ushort y = (ushort) ( first + len ); y <= bottom; ++y )
+            markRowDirty( y );      // exposed: every cell goes out again
+        return True;
+        }
+    return False;
+}
+
+static void vioTryScroll()
+{
+    if( !gPrevValid || gPrevCh == 0 || gDirtyCount < 3u * gShadowCols )
+        return;
+
+    /* Candidate window tops, the first few dirty rows: a frame that redraws
+       one changed line above the scrolled region -- a heading, a moved clock
+       -- makes its own row the first dirty one, and the shift starts below it.
+       Fewer than half a dozen starts covers the shapes that occur, and every
+       start the search gives up on costs nothing but the comparisons. */
+    for( ushort y = 0, tried = 0; y < gShadowRows && tried < 4; ++y )
+        {
+        if( !rowIsDirty( y ) )
+            continue;
+        ++tried;
+        if( vioScrollFrom( y ) )
+            return;
+        }
+}
+
 /* Send what has been drawn and not yet sent, as few times as the screen will take.
    This is the only place either back end writes cells, which is what makes a
    repaint cost what changed rather than what was drawn -- and what makes a repaint
@@ -1338,7 +1486,20 @@ static void flushCells()
         // setScreenMode drops the shadow for the same reason: nobody knows what the
         // new screen holds, so nothing may be written on the strength of that.
         forgetPending();
+        gPrevValid = False;         // and the frame beside it is a stranger now
         return;
+        }
+
+    /* Shift-shaped frames go to the hardware as one scroll before the run
+       loop gets them (see vioTryScroll; VIO only -- a stream has no scroll
+       to ask for, and the wire is the cheap one). */
+    struct timeb t0;                // what this frame costs, for the interval
+    t0.time = 0;
+    t0.millitm = 0;
+    if( gVio )
+        {
+        ftime( &t0 );
+        vioTryScroll();             // shift-shaped frames: one scroll, few rows
         }
 
     for( ushort y = 0; y < gShadowRows; ++y )
@@ -1368,6 +1529,7 @@ static void flushCells()
                         }
                     VioWrtCellStr( (PCH) gVioRow, (USHORT) ( len * 2 ), y, first,
                                    kVioSession );
+                    ++gVioCalls;
                     }
                 continue;
                 }
@@ -1398,6 +1560,24 @@ static void flushCells()
         }
 
     forgetPending();
+
+    // The screen now holds the shadow, so the shadow is the frame the next
+    // flush will compare against for the scroll shape (vioTryScroll).
+    if( gPrevCh != 0 )
+        {
+        memcpy( gPrevCh, gShadowCh, shadowCells() );
+        memcpy( gPrevAttr, gShadowAttr, shadowCells() );
+        gPrevValid = True;
+        }
+
+    if( gVio )
+        {
+        struct timeb t1;
+        ftime( &t1 );
+        gVioFlushMs = (unsigned long)
+            ( ( (long) t1.time - (long) t0.time ) * 1000L
+              + (long) t1.millitm - (long) t0.millitm );
+        }
 }
 
 void THardwareInfo::flushScreen() noexcept
@@ -1775,5 +1955,16 @@ uint64_t THardwareInfo::getTickCountMs() noexcept
     ftime( &now );
     return (uint64_t) (long) now.time * 1000 + (uint64_t) now.millitm;
 }
+
+/* The write-call counters the application logs once a second (app.cpp, the
+   `vio` line): totals, because the app differences them itself, and plain C
+   because that is the cheapest thing this side of a header to share. */
+extern "C" {
+
+unsigned long tvVioStatCalls()   { return gVioCalls; }
+unsigned long tvVioStatScrolls() { return gVioScrolls; }
+unsigned long tvVioStatFlushMs() { return gVioFlushMs; }
+
+} // extern "C"
 
 #endif // __FLAT__ && __OS2__ && !__BORLANDC__
