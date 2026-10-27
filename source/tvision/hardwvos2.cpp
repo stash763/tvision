@@ -271,6 +271,35 @@ static Boolean gPrevValid = False;
 static unsigned long gVioCalls = 0;
 static unsigned long gVioScrolls = 0;
 
+/* What a scroll leaves behind: the attribute the exposed cells are filled
+   with, in the shape FTE hands the API -- a cell image whose high byte is
+   the attribute (~/code/fte/src/con_os2.cpp, ConScroll).  candidate9 passed
+   NULL here, which every OS/2 program in the field does not; see the kill
+   switch below for what that guess cost. */
+static const ushort gVioScrollFill = (ushort) ( kDefaultAttr << 8 );
+
+/* The shortcut is opt-in until the box vouches for the call: candidate9 had
+   it unconditional, and the first scrolled frame of the first streamed answer
+   froze the machine so hard the process could not be killed and a reboot was
+   the only way out (TESTING.md, "The kernel still drew the screen").  The
+   call's shape matches FTE's in every parameter but the NULL attribute
+   pointer -- which, if eCS's VIO server reads it without checking, is a
+   kernel read of address 0, exactly the kind of fault a session does not
+   survive -- but one does not debug a kernel by pointing candidate builds at
+   it and standing by.  ATUI_VIOSCROLL=1 turns the shortcut on; the probe
+   (probe_scroll.cpp) is what earns the default. */
+static int gVioScrollAllowed = -1;
+
+static Boolean vioScrollAllowed()
+{
+    if( gVioScrollAllowed < 0 )
+    {
+        const char *on = getenv( "ATUI_VIOSCROLL" );
+        gVioScrollAllowed = ( on != 0 && on[0] != '0' ) ? 1 : 0;
+    }
+    return gVioScrollAllowed == 1;
+}
+
 /* What the last frame cost to send, in milliseconds -- the number that tells
    the application's repaint interval how much a frame is worth on this
    machine.  A P4 spends a few on a scrolled frame; a 486 spends tens, and an
@@ -1429,10 +1458,11 @@ static Boolean vioScrollFrom( ushort first )
 
         const ushort bottom = (ushort) ( first + len + k - 1 );
         //  bsesub.h: VioScrollUp( top, left, bottom, right, lines, pAttrFill,
-        //          session ) -- the exposed rows take no fill attribute, the
-        //          flush writes every cell of them from the shadow right after.
+        //          session ) -- exposed cells take the fill cell above, and
+        //          the flush writes every cell of them from the shadow right
+        //          after whatever the scroll leaves there.
         if( VioScrollUp( first, 0, bottom, (ushort) ( gShadowCols - 1 ),
-                         k, 0, kVioSession ) != NO_ERROR )
+                         k, (PBYTE) &gVioScrollFill, kVioSession ) != NO_ERROR )
             return False;           // no scroll, and so no writes either way
         ++gVioScrolls;
         for( ushort y = first; y < first + len; ++y )
@@ -1446,7 +1476,8 @@ static Boolean vioScrollFrom( ushort first )
 
 static void vioTryScroll()
 {
-    if( !gPrevValid || gPrevCh == 0 || gDirtyCount < 3u * gShadowCols )
+    if( !vioScrollAllowed()          // the box has not vouched for the call yet
+        || !gPrevValid || gPrevCh == 0 || gDirtyCount < 3u * gShadowCols )
         return;
 
     /* Candidate window tops, the first few dirty rows: a frame that redraws
