@@ -660,6 +660,7 @@ static void pmTakeCommand( int id )
         { 1103, 0x19, "Alt-P providers" },
         { 1104, 0x17, "Alt-I settings"  },
         { 1105, 0x14, "Alt-T theme"     },
+        { 1106, 0x1F, "Alt-S switch model" },
         { 1110, 0x2D, "Alt-X quit"      },
         { 1201, 0x1E, "Alt-A about"     },
         };
@@ -1360,6 +1361,15 @@ ushort THardwareInfo::getScreenRows() noexcept
 ushort THardwareInfo::getScreenCols() noexcept
 {
     return gCols;
+}
+
+/* The one windowed front there is: atui sits in a PM window, and the menu
+   bar, the frame and the caret around it are the desktop's.  See
+   hardware.h -- and see initMenuBar_ in the application, which stops drawing
+   a second menu bar once this answers True. */
+Boolean THardwareInfo::windowed() noexcept
+{
+    return True;
 }
 
 ushort THardwareInfo::getScreenMode() noexcept

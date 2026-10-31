@@ -1313,6 +1313,13 @@ ushort THardwareInfo::getScreenCols() noexcept
     return gCols;
 }
 
+/* A VIO session is the screen: the whole of it, with no window and no
+   chrome belonging to anybody else.  See hardware.h. */
+Boolean THardwareInfo::windowed() noexcept
+{
+    return False;
+}
+
 ushort THardwareInfo::getScreenMode() noexcept
 {
     ushort mode = TDisplay::smCO80;

@@ -84,6 +84,12 @@ public:
    over the desktop and taken away.  What goes out is what the application last
    drew, so this is a repair and not a clear. */
     static void redrawScreen() noexcept;
+/* True when the "screen" is a window of a desktop system rather than the whole
+   console.  A window comes with chrome the platform owns -- a menu bar first --
+   and an application that drew its own would be answering a question nobody
+   asked; the menu-bar row is then the application's to use or leave empty.
+   Every console front, VIO and the terminals included, answers False.  */
+    static Boolean windowed() noexcept;
 /* Two spellings of the same call, not two different calls: the legacy build hands
    the driver an array of two-byte cells, which is what a CHAR_INFO is made of
    (compat/windows/windows.h defines the type for every compiler that has no

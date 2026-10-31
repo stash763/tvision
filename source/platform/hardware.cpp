@@ -33,6 +33,8 @@ ushort THardwareInfo::getCaretSize() noexcept { return platf->getCaretSize(); }
 BOOL THardwareInfo::isCaretVisible() noexcept { return platf->isCaretVisible(); }
 ushort THardwareInfo::getScreenRows() noexcept { return platf->getScreenRows(); }
 ushort THardwareInfo::getScreenCols() noexcept { return platf->getScreenCols(); }
+/* The terminal is the screen, whole; no platform chrome anywhere near it. */
+Boolean THardwareInfo::windowed() noexcept { return False; }
 ushort THardwareInfo::getScreenMode() noexcept { return platf->getScreenMode(); }
 void THardwareInfo::setScreenMode( ushort ) noexcept {}
 void THardwareInfo::clearScreen( ushort, ushort ) noexcept { platf->clearScreen(); }
