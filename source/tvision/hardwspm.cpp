@@ -34,16 +34,41 @@
  *   - the mouse: PM's (position, buttons held) is the same contract OS/2's
  *     VIO mouse queue fills, and TEventQueue turns it into press, release
  *     and drag, so the driver reports state, never edges.
- *   - the font: FATTRS + GpiCreateLogFont(hps, 0, FCID, &fattrs) +
- *     GpiSetCharSet -- the recipe of the toolkit's palette sample -- with
- *     GpiAssociate carrying it into every WinBeginPaint PS.
+ *   - the grid itself -- cells, glyphs, colours, clearing --: IBM's AVIO
+ *     page, not a hand-drawn one.  GpiCreatePS(PU_PELS | GPIF_DEFAULT
+ *     | GPIT_MICRO | GPIA_ASSOC) on the window's DC, VioCreatePS for a
+ *     page of rows and columns, VioAssociate to hang the page on the
+ *     window: eFTE's construction verbatim (g_pm.cpp:2015..2030).  A page
+ *     is a BIOS text screen -- attribute-first cell strings, CP850 glyphs,
+ *     the attribute byte's own palette, scroll-up clearing -- so the VioWrt
+ *     family and the VioScroll family that hardwvos2.cpp already speaks
+ *     write here too, the page handle taking the slot the session console's
+ *     handle takes.  The alternative, this driver drawing every cell itself with
+ *     WinFillRect and GpiCharStringAt, was builds two through seven, and
+ *     the box found each answer wrong: the post-mortem is the screenshot
+ *     log (transparent holes where unpainted rows let the desktop show
+ *     through, colours asked of GpiSetColor in a colour long it reads as
+ *     a palette index).  eFTE has shipped this page engine for years on
+ *     kernels exactly this one; that beats one more guess.
+ *   - the wait: WinGetMsg as the engine and nothing else -- eFTE's
+ *     ConGetEvent (g_pm.cpp:2385) and every TOOLKIT sample fetch their
+ *     whole life through it.  This driver first polled with DosSleep and
+ *     WinPeekMsg, invented because the VIO driver it mirrors has no
+ *     message loop; the box answered that design with errors and a deaf
+ *     window (atuipm.run.txt builds two and three).  Timeouts ride on
+ *     posted messages -- Watcom 1.9's PM headers carry no WinSetTimer at
+ *     all (measured), and eFTE wakes its blocked fetches with
+ *     WinPostMsg, which is the mechanism copied here.
  *
  * The shadow/dirty machinery is the VIO driver's, copied with the reasons
  * in its comments: a repaint must cost what changed, and the screen must
  * see one state per frame, never the fill-then-text pair the classic
- * writer produces.  Here the "screen" is the window and "sending" is
- * WinInvalidateRect -- the paint that follows draws the shadow, so the
- * dirty bits clear at the end of WM_PAINT rather than at flush.
+ * writer produces.  Here the "screen" is the page: a flush pushes each
+ * dirty run as one cell string (VioWrtCellStr), the page repaints the
+ * window holding it, and the dirty bits clear at the flush -- the moment
+ * the truth leaves the shadow.  WM_PAINT no longer draws the screen at
+ * all; it re-shows the page whole (VioShowBuf), which is what occlusion
+ * and un-minimize need and the page answers from memory.
  *
  * Known v1 limits, each one a decision and not an oversight:
  *
@@ -56,6 +81,10 @@
  *     and after five seconds of not having exited, it stops asking.
  *   - no clipboard (the PM one is reachable from here, unlike the VIO
  *     driver's excuse, and wiring it is still undone), no wheel.
+ *   - the caret is PM's own -- WinCreateCursor, created on focus and
+ *     recreated to move, the eFTE pattern (g_pm.cpp:2105..2130) -- and
+ *     PM's caret speaks one shape, a flashing solid block; tvision's
+ *     sizes all become that.
  */
 
 #if defined( __FLAT__ ) && defined( __OS2__ ) && !defined( __BORLANDC__ ) \
@@ -75,6 +104,13 @@
 #define INCL_DOSERRORS
 #define INCL_GPI
 #define INCL_WIN
+#define INCL_VIO        // bsesub.h:365 keeps the whole VIO section -- the
+                        // HVIO handle, the VioWrt/VioScroll write side and
+                        // their VIO16 import aliases -- behind this one
+                        // word; eFTE's g_pm.cpp:25 asks with it too
+#define INCL_AVIO       // pm.h:35 reads this one and adds pmavio.h: the
+                        // page engine's VioCreatePS, VioAssociate and
+                        // friends, the page half of the same VIO16 family
 
 #define Uses_TKeys
 #define Uses_TEvent
@@ -85,32 +121,48 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <process.h>        // _beginthread, for the wake thread
+
+/* W869 ("_beginthread requires the build target to be multi-threaded")
+   speaks of a runtime this program is not: core/thread_os2.cpp measured
+   both runtimes on the box and found the Watcom OS/2 32-bit one upgrades
+   itself in place on the first _beginthread -- which is why atui.exe
+   ships threads without -bm, and this alarm thread is the same call from
+   the same kind of thread. */
+#pragma disable_message( 869 )
 #include <sys/timeb.h>
 
 enum
     {
-    kPollMs     = 10,       // as in the VIO driver: the wait's slice
     kDefCols    = 80,
     kDefRows    = 25,
     kDefaultAttr = 0x07,    // light grey on black, the VGA default cell
 
     kCellW      = 9,        // the fallback grid: VGA's classic cell,
     kCellH      = 16,       // right when the font asks for nothing else
+    kCellWReq   = 8,        // the cell to ask the engine for: the classic
+    kCellHReq   = 16,       // VGA text cell, 80x25 of it fitting any
+                            // screen this tool has ever met
     kCellWMin   = 4,        // measurements outside these are not believed
     kCellWMax   = 32,
     kCellHMin   = 6,
     kCellHMax   = 32,
 
-    /* GpiCreateLogFont's third argument is the id the set is installed
-       under -- 1..255 is the application's range, and FCID 1 is what the
-       toolkit's palette sample picks. */
-    kFontFcid   = 1,
+    /* WinPeekMsg's only flag, eFTE's spelling (PM_NOREMOVE): the driver
+       asks "anything in the queue" and lets WinGetMsg do the taking.  The
+       PMQ_NOSENDUSERPAINT bit an earlier design added is nowhere in the
+       references, and every WinPeekMsg carrying it failed 0x81019 on the
+       box (measured, atuipm.run.txt build three) -- correlation the fix
+       takes, causation the box may yet refine. */
+    kPmqNoRemove        = 0x0000,
 
-    /* WinPeekMsg's flags, from the toolkit docs: PMQ_* are not in
-       Watcom's headers (measured), and 0x1000 keeps PM from sending
-       WM_USERPAINT to the focus window while peeking. */
-    kPmqRemove          = 0x0001,
-    kPmqNoSendUserPaint = 0x1000,
+    /* The alarm eFTE owns a blocked WinGetMsg with: a posted message.
+       WM_USER + 1 is eFTE's own numbering for exactly this purpose
+       (g_pm.cpp:59, UWM_NOTIFY). */
+    kWmWake             = WM_USER + 1,
+    kIdleWakeMs         = 250,    // the pace of a waiting-with-nothing-to-do
+    kWakeMsMin          = 10,     // never post faster than this
+    kWakeStack          = 64UL * 1024UL,
 
     /* The window class and its resources, under the one id the frame is
        built with (the stdwnd sample's ID_WINDOW = 256, same numbering so
@@ -118,6 +170,12 @@ enum
     kIdWindow   = 256,
 
     kMouseQueue = 16,       // mouse events held between pump and drain
+
+    /* WM_KILLFOCUS is absent from both header trees (measured), WM_SETFOCUS
+       is there at pmwin.h:718 with IBM's value; IBM's own numbering puts
+       the death notice next door at 0x0010.  Only ever used for the log
+       line that says which of the two the window saw. */
+    kWmKillFocus = 0x0010,
 
     kQuitForceMs = 5000,    // how long the closed window waits for the
                             // application to obey the injected Alt-X
@@ -187,9 +245,13 @@ static HAB    gHab      = 0;
 static HMQ    gHmq      = 0;
 static HWND   gFrame    = 0;
 static HWND   gClient   = 0;
-static HPS    gHpsFont  = 0;    // the PS the screen font is installed on;
-                                // paint PSes inherit it by GpiAssociate
-static Boolean gFontOk  = False;
+static HPS    gHpsScreen = 0;   // the PS built on the window's DC and
+                                // associated with the page (GPIA_ASSOC);
+                                // WinBeginPaint is handed it, eFTE's way
+static HVPS   gHvps      = 0;   // the AVIO page: a BIOS text screen that
+                                // remembers its cells and shows them in
+                                // the window it is associated to
+static Boolean gAvioOk   = False;
 static Boolean gPmUp    = False; // window + queue exist; drawing is legal
 static Boolean gClosed  = False; // the user closed the window
 static Boolean gQuitKeySent = False;
@@ -202,8 +264,10 @@ static ushort gRows = kDefRows;
 static ushort gCellPxW = kCellW;
 static ushort gCellPxH = kCellH;
 
-// The caret as the application left it; the window has no caret of its own,
-// so WM_PAINT draws it as the cell's colours swapped.
+/* The caret is PM's own (WinCreateCursor), which exists only while the
+   window has focus -- so the driver remembers what the application asked
+   for and re-creates it when focus returns.  gFocused is that memory. */
+static Boolean gFocused = False;
 static ushort gCaretX = 0;
 static ushort gCaretY = 0;
 static Boolean gCaretShown = False;
@@ -242,13 +306,23 @@ static uchar gMouseButtons = 0;         // what is held right now
 
 static Boolean gInterruptWait = False;
 
+/* The alarm clock: a thread that sleeps and posts kWmWake, because Watcom
+   1.9 carries no PM timers (measured: no WinSetTimer anywhere in its
+   headers) and eFTE -- built with this very compiler -- wakes its blocked
+   WinGetMsg with posted messages (g_pm.cpp:59 and its WinPostMsg calls).
+   The pace follows the application's last stated timeout: a streaming
+   wait of 20 ms is answered in about 20 ms, an idle wait of nothing-in-
+   particular posts four times a second, which is nothing to measure. */
+static unsigned long gWakeMs = kIdleWakeMs;
+static Boolean gWakeUp = False;
+static unsigned gWakeTid = 0;
+
 /* Counting what the screen costs for the application's once-a-second log:
-   runs drawn (the cell writes of this driver -- one WinFillRect or
-   GpiCharStringAt each), whole paints done, and what the last one took. */
-static unsigned long gPmRuns = 0;
-static unsigned long gPmPaints = 0;
+   cell strings pushed to the page (one per dirty run), whole re-shows the
+   window asked for, and what the last one took. */
+static unsigned long gPmRuns = 0;     // cell strings pushed to the page
+static unsigned long gPmPaints = 0;   // WM_PAINTs that re-showed it
 static unsigned long gPmPaintMs = 0;
-static Boolean gInvalidatePending = False;
 
 /* atuipm.run.txt: the same lifeline the probe carried, because a PM image
    started at the box's own display has no console to complain to, and the
@@ -259,6 +333,9 @@ static Boolean gInvalidatePending = False;
    deaf or blind, which is otherwise invisible. */
 static FILE *gLog = 0;
 static Boolean gKeyLogged = False;
+static Boolean gFocusInLogged = False;    // which window answers focus, and
+static Boolean gFocusOutLogged = False;   // whether the pointer is heard
+static Boolean gMouseLogged = False;      // at all, each logged once
 
 static void pmLog( const char *what )
 {
@@ -285,39 +362,14 @@ static void pmLogErr( const char *what )
     fflush( gLog );
 }
 
-/*
- * The BIOS colour byte made visible.  The themes were designed on the VGA
- * palette, so the palette is written out rather than asked: the system
- * palette of a desktop can be restyled by its user, and a theme should not
- * change because someone liked other colours.  Longs are PM's RGB shape --
- * red in the low byte (the RGB macro's order), and the GPI colour
- * primitives take the same long.
+/* No palette table here: the attribute byte is drawn by the page engine
+ * with its own colours, which are the BIOS ones -- the same reading the
+ * VIO session gives the same bytes.  The table this file used to carry
+ * (kRgb, sixteen longs) fed colour longs to GpiSetColor, whose argument
+ * is a palette *index*: every colour request was a garbage index, which
+ * is post-mortem half of "the colour scheme is not working at all"
+ * (screenshot3).  The engine knows better than this file ever will.
  */
-static const long kRgb[16] =
-    {
-    0x00000000L,      0x00AA0000L,      //   0 black      1 blue
-    0x0000AA00L,      0x00AAAA00L,      //   2 green      3 cyan
-    0x000000AAL,      0x00AA00AAL,      //   4 red        5 magenta
-    0x000055AAL,      0x00AAAAAAL,      //   6 brown      7 light grey
-    0x00555555L,      0x00FF5555L,      //   8 grey       9 bright blue
-    0x0055FF55L,      0x00FFFF55L,      //  10 br green  11 br cyan
-    0x005555FFL,      0x00FF55FFL,      //  12 br red    13 br magenta
-    0x0055FFFFL,      0x00FFFFFFL,      //  14 yellow    15 white
-    };
-
-static long colorOfFg( int attr )
-{
-    // Bits 0-3 are the foreground with the bright bit already in place,
-    // exactly the index into the VGA palette.
-    return kRgb[ attr & 0x0F ];
-}
-
-static long colorOfBg( int attr )
-{
-    // Bits 4-6 are the background and bit 7 brightens it -- the placement
-    // every BIOS attribute table uses and the one the VIO driver keeps.
-    return kRgb[ ((attr >> 4) & 0x07) | ((attr & 0x80) ? 8 : 0) ];
-}
 
 //
 // The shadow
@@ -377,16 +429,15 @@ static void rememberCell( ushort x, ushort y, const CHAR_INFO &cell )
     gShadowAttr[at] = (uchar) ( cell.Attributes & 0xFF );
 }
 
-/* Cells owed a paint: ask the window for it.  A dirty-cell rectangle
-   would clip the paint to what changed, which is a saving worth having
-   once the paint itself is measured; the whole window asks for one paint
-   of everything, correct first and fast later. */
+/* Ask the window for a whole repaint of the page: for the moments the
+   window may hold something the page no longer shows (after a suspend,
+   after a clear) and for redrawScreen.  Ordinary frames never come here:
+   a cell string written to the page repaints what it covers by itself. */
 static void pmInvalidateWhole()
 {
     if( !gPmUp )
         return;
     WinInvalidateRect( gClient, 0, False );
-    gInvalidatePending = True;
 }
 
 //
@@ -581,125 +632,84 @@ static void pmTakeChar( ULONG flags, short ch, ushort virt, uchar scan )
     gKeyPending = True;
 }
 
+/* A PM menu command becomes the very key the application already answers.
+   The menu item and the hot key are two doors to the same room: Help,
+   Undo, Providers, Settings, Theme, Exit and About each carry an Alt
+   combination that app.cpp's own menu bar answers (its initMenuBar), and
+   a menu click injects a byte-identical key event -- so identical that
+   the application cannot tell a mouse from a keyboard, which is exactly
+   the point of the THardwareInfo seam.  The scans are BIOS's for h, u,
+   p, i, t, x, a, and Alt-X of close-the-window is the same arithmetic.
+   The ids are atuipm.rc's; the rc is the top of tools/os2, and this
+   table lives two screens below its last line, which is how keeping
+   them in step stays possible.  Switch model is absent on purpose: its
+   submenu's contents are app-side knowledge, and it arrives with the
+   PM-side menu building that the native-dialog phase brings. */
+static void pmTakeCommand( int id )
+{
+    struct CommandKey
+        {
+        int id;
+        uchar scan;
+        const char *name;
+        };
+    static const CommandKey kCommands[] =
+        {
+        { 1101, 0x23, "Alt-H help"      },
+        { 1102, 0x16, "Alt-U undo"      },
+        { 1103, 0x19, "Alt-P providers" },
+        { 1104, 0x17, "Alt-I settings"  },
+        { 1105, 0x14, "Alt-T theme"     },
+        { 1110, 0x2D, "Alt-X quit"      },
+        { 1201, 0x1E, "Alt-A about"     },
+        };
+    for( unsigned i = 0; i < sizeof( kCommands ) / sizeof( kCommands[ 0 ] ); ++i )
+        if( kCommands[ i ].id == id )
+            {
+            if( gLog != 0 )
+                {
+                fprintf( gLog, "command %d -> %s\n", id, kCommands[ i ].name );
+                fflush( gLog );
+                }
+            fillKey( gPendingKey, 0, kCommands[ i ].scan, kbAltShift );
+            gKeyPending = True;   // the click wins the slot: it is the newer
+            return;               // intention, and whatever it replaces was
+            }                     // one keystroke nobody double-clicked
+    if( gLog != 0 )
+        fprintf( gLog, "command %d unmapped\n", id ), fflush( gLog );
+}
+
 //
 // Window procedure
 //
 
-static void pmPaint( HPS hpsPaint )
+/* PM's caret: a flashing solid block, created when the focus arrives and
+   re-created to move -- eFTE's idiom (g_pm.cpp:2105..2130).  Its rectangle
+   is the cell's, in PM's bottom-up client coordinates.  There is no
+   redraw bookkeeping here because the caret is not drawn: the window
+   manager owns its maintenance, and that is one less thing this file can
+   get wrong on the box. */
+static void pmUpdateCaret()
 {
-    if( gShadowCh == 0 || gShadowCols != gCols || gShadowRows != gRows )
-        return;     // no picture of anything yet; drawing guesses is not drawing
-
-    if( gFontOk )
+    if( !gPmUp || !gFocused )
+        return;
+    if( !gCaretShown || gCaretX >= gCols || gCaretY >= gRows )
         {
-        GpiAssociate( gHpsFont, hpsPaint );
-        GpiSetCharSet( hpsPaint, kFontFcid );
+        WinDestroyCursor( gClient );
+        return;
         }
-    GpiSetBackMix( hpsPaint, BM_LEAVEALONE );  // text leaves its background:
-                                               // the fill below is the background
-
-    // Text reference point: GPI draws from the bottom left of the cell
-    // box upward, which is how the toolkit's palette sample centres its
-    // text (cyClient minus the box height, then GpiCharString at the
-    // result).  So the cell's bottom edge is the draw point and the box
-    // measured in pmInitFont -- the same measurement, mode notwithstanding
-    // -- is exactly what the cell must be to hold it, descender included.
-    const ushort cw = gCellPxW;
-    const ushort ch = gCellPxH;
-
-    for( ushort row = 0; row < gShadowRows; ++row )
-        {
-        // PM counts from the bottom; the shadow counts from the top.
-        const long yBottom = (long) gClientH - (long) ( row + 1 ) * (long) ch;
-        if( yBottom >= (long) gClientH )
-            continue;                       // scrolled out above the window
-        const size_t line = (size_t) row * gShadowCols;
-
-        ushort x = 0;
-        while( x < gShadowCols )
-            {
-            const long bg = colorOfBg( gShadowAttr[ line + x ] );
-            const ushort first = x;
-            long fg = colorOfFg( gShadowAttr[ line + x ] );
-            int attr = gShadowAttr[ line + x ];
-            ++x;
-            while( x < gShadowCols && gShadowAttr[ line + x ] == attr )
-                ++x;
-
-            RECTL rcl;
-            rcl.xLeft   = (long) first * (long) cw;
-            rcl.xRight  = (long) x * (long) cw;
-            rcl.yBottom = yBottom;
-            rcl.yTop    = yBottom + (long) ch;
-            WinFillRect( hpsPaint, &rcl, bg );
-            ++gPmRuns;
-
-            // Text run: blanks carry no ink and cost an ink call for
-            // nothing, so skip the ones at either end of the run.
-            ushort t = first;
-            while( t < x && gShadowCh[ line + t ] == ' ' )
-                ++t;
-            while( t < x )
-                {
-                const ushort textStart = t;
-                char text[ 256 ];
-                size_t n = 0;
-                while( t < x && n < sizeof( text ) - 1 )
-                    {
-                    const uchar c = gShadowCh[ line + t ];
-                    text[ n++ ] = (c < 0x20 || c == 0x7F) ? ' ' : (char) c;
-                    ++t;
-                    if( t < x && gShadowCh[ line + t ] == ' ' )
-                        {   // finish at the next blank run's end
-                        ushort p = t;
-                        while( p < x && gShadowCh[ line + p ] == ' ' )
-                            ++p;
-                        if( p >= x )
-                            break;          // trailing blanks: nothing to draw
-                        ++t;                // a single interior blank is text
-                        }
-                    }
-                if( n > 0 )
-                    {
-                    text[ n ] = '\0';
-                    GpiSetColor( hpsPaint, fg );
-                    POINTL ptl;
-                    ptl.x = (long) textStart * (long) cw;
-                    ptl.y = yBottom;              // cell bottom; box grows up
-                    GpiCharStringAt( hpsPaint, &ptl, (LONG) n, text );
-                    ++gPmRuns;
-                    }
-                while( t < x && gShadowCh[ line + t ] == ' ' )
-                    ++t;
-                }
-            }
-        }
-
-    // The caret last: the cell with its own colours swapped, which is what
-    // a hardware caret over a cell looks like.
-    if( gCaretShown
-        && gCaretY < gShadowRows && gCaretX < gShadowCols )
-        {
-        const size_t at = (size_t) gCaretY * gShadowCols + gCaretX;
-        const int attr = gShadowAttr[ at ];
-        RECTL rcl;
-        rcl.xLeft   = (long) gCaretX * (long) cw;
-        rcl.xRight  = rcl.xLeft + (long) cw;
-        rcl.yBottom = (long) gClientH - (long) ( gCaretY + 1 ) * (long) ch;
-        rcl.yTop    = rcl.yBottom + (long) ch;
-        WinFillRect( hpsPaint, &rcl, colorOfFg( attr ) );
-        const uchar c = gShadowCh[ at ];
-        if( c != ' ' && c >= 0x20 )
-            {
-            GpiSetColor( hpsPaint, colorOfBg( attr ) );
-            POINTL ptl;
-            ptl.x = rcl.xLeft;
-            ptl.y = rcl.yBottom;
-            char text[2] = { (char) c, '\0' };
-            GpiCharStringAt( hpsPaint, &ptl, 1, text );
-            }
-        ++gPmRuns;
-    }
+    /* Destroyed before it is re-made, eFTE's PMSetCursorPos (g_pm.cpp:
+       3210..3218): what must never survive the move is the old inversion.
+       Without this pair of calls a typed character sat under a stale
+       block until the next paint said otherwise. */
+    WinDestroyCursor( gClient );
+    WinCreateCursor( gClient,
+                     (LONG) gCaretX * (LONG) gCellPxW,
+                     (LONG) ( (long) gRows - (long) gCaretY - 1L )
+                           * (LONG) gCellPxH,
+                     (LONG) gCellPxW, (LONG) gCellPxH,
+                     CURSOR_FLASH | CURSOR_SOLID, (PRECTL) 0 );
+    WinShowCursor( gClient, TRUE );
 }
 
 static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
@@ -711,29 +721,48 @@ static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
             struct timeb t0;
             ftime( &t0 );
             RECTL rcl;
-            HPS hps = WinBeginPaint( hwnd, 0, &rcl );
+            HPS hps = WinBeginPaint( hwnd, gHpsScreen, &rcl );
             RECTL rect;
             WinQueryWindowRect( hwnd, &rect );
             gClientW = (ulong) ( rect.xRight - rect.xLeft );
             gClientH = (ulong) ( rect.yTop - rect.yBottom );
-            pmPaint( hps );
-            // The window holds the shadow now, wherever the paint reached;
-            // every cell is painted each time, so the frame ends even.
-            forgetPending();
-            gInvalidatePending = False;
+            if( gHvps != 0 )
+                {
+                // Not a draw: a re-show.  The page remembers every cell
+                // it has ever been handed and paints them from memory,
+                // which is why occlusion, resize and un-minimize need no
+                // paint logic of this driver's own -- eFTE's WM_PAINT is
+                // these same three calls (g_pm.cpp:2200).
+                VioShowBuf( 0, (USHORT) ( 2u * (unsigned long) gCols
+                                            * (unsigned long) gRows ),
+                            (HVIO) gHvps );
+                }
             WinEndPaint( hps );
             struct timeb t1;
             ftime( &t1 );
             gPmPaintMs = (unsigned long)
                 ( ( (long) t1.time - (long) t0.time ) * 1000L
                   + (long) t1.millitm - (long) t0.millitm );
-            if( gPmPaints == 0 )
+            if( gPmPaints == 0 && gHvps != 0 )
                 pmLog( "first paint" );
-            ++gPmPaints;
+            if( gHvps != 0 )
+                ++gPmPaints;
         }
         return 0;
 
+    case WM_ERASEBACKGROUND:
+        // The page fills every cell it shows, background included; the
+        // default erase pass would paint the client white first -- the
+        // white this window has been known for (eFTE returns FALSE for
+        // the same reason, g_pm.cpp:2048).
+        return (MRESULT) FALSE;
+
     case WM_SIZE:
+        // The page engine hears of the new client first -- eFTE forwards
+        // WM_SIZE to WinDefAVioWindowProc (g_pm.cpp:2065) to keep the
+        // associated viewport honest.  The grid is fixed, so all this
+        // file keeps afterwards is the pixel size the mouse maps against.
+        WinDefAVioWindowProc( hwnd, msg, (ULONG) mp1, (ULONG) mp2 );
         {
             RECTL rect;
             WinQueryWindowRect( hwnd, &rect );
@@ -741,6 +770,28 @@ static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
             gClientH = (ulong) ( rect.yTop - rect.yBottom );
         }
         return 0;
+
+    case WM_SETFOCUS:
+        gFocused = True;
+        if( !gFocusInLogged )
+            {
+            gFocusInLogged = True;
+            pmLog( "focus in" );   // keys can only arrive after this line;
+                                   // their absence without it is explained
+            }
+        pmUpdateCaret();
+        return WinDefWindowProc( hwnd, msg, mp1, mp2 );
+
+    case kWmKillFocus:
+        gFocused = False;
+        WinDestroyCursor( gClient );  // PM's caret lives only while the
+                                      // focus does
+        if( !gFocusOutLogged )
+            {
+            gFocusOutLogged = True;
+            pmLog( "focus out" );   // once: the fact is the news, every
+            }                       // theft after it is gossip
+        return WinDefWindowProc( hwnd, msg, mp1, mp2 );
 
     case WM_CHAR:
         if( SHORT1FROMMP( mp1 ) & kKcKeyUp )
@@ -790,6 +841,11 @@ static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
                        0,
                        (SHORT1FROMMP( mp2 ) & kKcCtrl) ? kbCtrlShift : 0 );
             putMouse( mouse );
+            if( !gMouseLogged )
+                {
+                gMouseLogged = True;   // the pump answers the pointer: this
+                pmLog( "mouse first" );// is the proof, and its absence the
+                }                      // answer about clicks at a deaf window
         }
         return 0;
 
@@ -799,6 +855,14 @@ static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
     // delivers button-up to the window that took the button-down, even for
     // releases outside it -- eFTE ships on exactly that and never drops a
     // held button, so the state above stays honest without asking.
+
+    case WM_COMMAND:
+        // Menu picks from the frame's PM menu.  PM delivers them to the
+        // client window -- the frame's default procedure forwards them --
+        // and each id becomes the hot key the application already answers
+        // (see pmTakeCommand).
+        pmTakeCommand( (int) SHORT1FROMMP( mp1 ) );
+        return 0;
 
     case WM_CLOSE:
         // The way out the user expects from a window: the application is
@@ -824,33 +888,103 @@ static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
 // while the application thinks.
 //
 
-static void pumpMessages()
-{
-    /* NULLHANDLE, not HWND_DESKTOP: the peek must see the messages sent to
-       every window of this thread -- WM_PAINT belongs to the client window,
-       and a desktop-only filter would leave the window asking for paint
-       forever with nobody dispatching it.  It is also what both references
-       do: eFTE's loop (g_pm.cpp:2408) and the probe's.  WinPeekMsg, unlike
-       WinGetMsg, does not end the pump on WM_QUIT -- so the quit message,
-       once removed from the queue, is turned into the closed flag here. */
-    QMSG q;
-    while( WinPeekMsg( gHab, &q, NULLHANDLE, 0, 0,
-                       kPmqRemove | kPmqNoSendUserPaint ) )
-        {
-        if( q.msg == WM_QUIT )
-            {
-            gClosed = True;
-            if( gClosedMs == 0 )
-                gClosedMs = THardwareInfo::getTickCountMs();
-            break;
-            }
-        WinDispatchMsg( gHab, &q );
-    }
-}
-
 static Boolean anyInput()
 {
     return gKeyPending || gMouseCount > 0;
+}
+
+/* One message out of the queue, answered.  False is the order to stop
+   waiting -- WM_QUIT, which the close posts -- and the application gets
+   the same closed flag the VIO driver raises for a Ctrl-C: quit is quit,
+   however it was dressed.  The wake message is consumed here: its addressee
+   is the waiting loop, not the window. */
+static Boolean deliverMessage( QMSG &q )
+{
+    if( q.msg == WM_QUIT )
+        {
+        gClosed = True;
+        if( gClosedMs == 0 )
+            gClosedMs = THardwareInfo::getTickCountMs();
+        return False;
+        }
+    if( q.msg == kWmWake )
+        return True;
+    WinDispatchMsg( gHab, &q );
+    return True;
+}
+
+/* Drain what the queue already holds, without blocking: the exact pair
+   eFTE's ConGetEvent uses (g_pm.cpp:2406..2412) -- a NOREMOVE peek asks
+   whether there is anything, and the WinGetMsg that follows takes it and
+   returns at once, because what it would wait for is already there.  Both
+   calls NULLHANDLE-filtered and flag-zero, eFTE's spelling throughout.
+
+   The first failure logs the PM error's human text: build three's pump
+   failed every call with 0x81019 and nothing in the header trees names
+   that number, so the box's own error table is the only witness. */
+static long gPumpCalls = 0;
+static long gPumpLogs = 0;
+static Boolean gPumpErrLogged = False;
+
+static void dispatchPending()
+{
+    for( int guard = 0; guard < 1024; ++guard )
+        {
+        QMSG probe;
+        const BOOL seen = WinPeekMsg( gHab, &probe, NULLHANDLE, 0, 0,
+                                      kPmqNoRemove );
+        ++gPumpCalls;
+        if( gPumpLogs < 10 && gLog != 0 )
+            {
+            ++gPumpLogs;
+            fprintf( gLog, "peek %ld seen=%d msg=0x%lx err=0x%lx\n",
+                     gPumpCalls, (int) seen,
+                     seen ? (unsigned long) probe.msg : 0UL,
+                     seen ? 0UL : (unsigned long) WinGetLastError( gHab ) );
+            fflush( gLog );
+            }
+        if( !seen )
+            {
+            if( !gPumpErrLogged )
+                {
+                gPumpErrLogged = True;
+                pmLogErr( "WinPeekMsg" );
+                }
+            return;
+            }
+        QMSG q;
+        if( !WinGetMsg( gHab, &q, NULLHANDLE, 0, 0 ) )
+            {
+            gClosed = True;   // FALSE means the quit arrived (eFTE: return -1)
+            if( gClosedMs == 0 )
+                gClosedMs = THardwareInfo::getTickCountMs();
+            return;
+            }
+        if( !deliverMessage( q ) )
+            return;
+        if( anyInput() )
+            return;       // what the application came for is in hand; the
+        }                 // rest of the queue can wait for the next turn
+}
+
+/* The alarm thread, which is eFTE's PipeThread pattern from head to foot
+   (g_pm.cpp:4341..4426, built with this compiler and running on boxes like
+   this one): WinInitialize(0) for the connection, post the notice into the
+   window's queue to wake a blocked WinGetMsg, WinTerminate on the way out
+   -- which is why the flag goes False before the window dies, and
+   pmCloseWindow waits out a cycle: WinTerminate here lands the thread's
+   own connection, whenever that happens to be. */
+static void pmWakeLoop( void * )
+{
+    const HAB hab = WinInitialize( 0 );
+    while( gWakeUp )
+        {
+        DosSleep( gWakeMs );
+        if( gWakeUp && gClient != 0 )
+            WinPostMsg( gClient, kWmWake, 0, 0 );
+        }
+    if( hab != 0 )
+        WinTerminate( hab );
 }
 
 //
@@ -858,78 +992,101 @@ static Boolean anyInput()
 // its birth certificate -- class, frame with resources, then show.
 //
 
-static void pmInitFont()
+/* The grid's engine: IBM's AVIO page, assembled the way eFTE's PM front
+   assembles it (g_pm.cpp:2015..2030).  A page is a BIOS text screen --
+   cells of attribute over CP850 character, the attribute byte's own
+   palette, its own scroll and clear -- and the association makes the
+   window show it.  Which font, which glyphs, which colours the attribute
+   bytes mean: those are the kernel's answers now, and they have shipped
+   longer than this file has existed.  Everything this driver used to do
+   by hand to get the same job (builds two through seven: the font recipe,
+   the palette table, the fill-and-ink paint) is gone, and each of its
+   measured failures with it. */
+static Boolean pmInitAvio()
 {
-    /* The header calls this WinOpenWindowDC and says it returns an HDC --
-       the 1.x signature.  On 2.x it hands back a presentation-space handle
-       (that is why WinReleasePS frees it); the cast records that the
-       disagreement is the header's, not the code's. */
-    gHpsFont = (HPS) WinOpenWindowDC( gClient );
-    if( gHpsFont == 0 )
-        return;
-    // No WinSetCp: the Watcom prototype is the 1.x (HMQ, ULONG) form, the
-    // toolkit samples draw without ever calling it, and neither eFTE nor
-    // the samples have needed it.  If the theme's box drawing arrives in
-    // the wrong glyphs, the codepage is the first knob to reach for --
-    // with the screen in front of whoever fixes it.
-    FATTRS fa;
-    memset( &fa, 0, sizeof( fa ) );
-    fa.usRecordLength = sizeof( fa );
-    fa.lMatch = 0;
-    strcpy( fa.szFacename, "WarpSans Fixed" ); // the system's fixed face
-    fa.idRegistry = 0;
-    fa.usCodePage = 0;                 // whatever the PS says
-    fa.lMaxBaselineExt = 423L;         // 16 pixels at 96 dpi (0.01 mm)
-    fa.lAveCharWidth = 238L;           // 9 pixels
-    fa.fsType = 0;
-    fa.fsFontUse = 0;                  // any face that matches
-
-    if( !GpiCreateLogFont( gHpsFont, (PSTR8) 0, kFontFcid, &fa ) )
-        return;
-    if( !GpiSetCharSet( gHpsFont, kFontFcid ) )
-        return;
-
-    // Measure what actually came.  GpiQueryTextBox is the five argument
-    // form in the Watcom header (pmgpi.h:923): the corner mode and a
-    // POINTL array are explicit.  TXTBOX_TOPLEFT anchors the box's top
-    // left corner at the draw point, so the cell is the box -- width the
-    // advance of M, this being a fixed face, height the full cell with
-    // the descender inside.  The corners are folded by min and max rather
-    // than by position: which corner comes back first is a spec detail
-    // read rather than seen, and code that does not care cannot be wrong
-    // about it.
-    POINTL ptlBox[ 4 ];
-    const LONG got = GpiQueryTextBox( gHpsFont, 1, "M", TXTBOX_TOPLEFT, ptlBox );
-    if( gLog != 0 )
-        fprintf( gLog, "textbox M rc=%ld p0=(%ld,%ld) p1=(%ld,%ld) p2=(%ld,%ld) p3=(%ld,%ld)\n",
-                 got, (long) ptlBox[0].x, (long) ptlBox[0].y,
-                 (long) ptlBox[1].x, (long) ptlBox[1].y,
-                 (long) ptlBox[2].x, (long) ptlBox[2].y,
-                 (long) ptlBox[3].x, (long) ptlBox[3].y ), fflush( gLog );
-    if( got )
+    /* The DC and a PS built on it with GPIA_ASSOC -- the association flag
+       is what lets WinBeginPaint hand the same PS to each paint, which
+       eFTE passes to it (g_pm.cpp:2016, 2201). */
+    const HDC hdc = WinOpenWindowDC( gClient );
+    if( hdc == 0 )
         {
-        LONG xlo = ptlBox[0].x, xhi = ptlBox[0].x;
-        LONG ylo = ptlBox[0].y, yhi = ptlBox[0].y;
-        for( int i = 1; i < 4; ++i )
-            {
-            if( ptlBox[i].x < xlo ) xlo = ptlBox[i].x;
-            if( ptlBox[i].x > xhi ) xhi = ptlBox[i].x;
-            if( ptlBox[i].y < ylo ) ylo = ptlBox[i].y;
-            if( ptlBox[i].y > yhi ) yhi = ptlBox[i].y;
-            }
-        const long w = xhi - xlo;
-        const long h = yhi - ylo;
-        if( w >= kCellWMin && w <= kCellWMax && h >= kCellHMin && h <= kCellHMax )
-            {
-            gCellPxW = (ushort) w;
-            gCellPxH = (ushort) h;
-            gFontOk = True;
-            return;
-            }
+        pmLogErr( "avio: WinOpenWindowDC" );
+        return False;
         }
-    // A face matched but did not measure; keep drawing with it and the
-    // classic cell -- better than no font at all.
-    gFontOk = True;
+    SIZEL sizl;
+    sizl.cx = 0;
+    sizl.cy = 0;
+    gHpsScreen = GpiCreatePS( gHab, hdc, &sizl,
+                              PU_PELS | GPIF_DEFAULT | GPIT_MICRO
+                              | GPIA_ASSOC );
+    if( gHpsScreen == 0 )
+        {
+        pmLogErr( "avio: GpiCreatePS" );
+        return False;
+        }
+
+    /* rows and columns, format 0, attribute format 1, reserved 0 --
+       eFTE's exact arguments (g_pm.cpp:2018), its page merely sized to
+       its own maximum where this one is sized to the grid the application
+       was started with. */
+    const USHORT rcPs = VioCreatePS( &gHvps, (SHORT) gRows, (SHORT) gCols,
+                                     0, 1, 0 );
+    if( gLog != 0 )
+        fprintf( gLog, "avio ps rc=%u hvps=%u\n",
+                 (unsigned) rcPs, (unsigned) gHvps ), fflush( gLog );
+    if( rcPs != 0 )
+        return False;
+
+    const USHORT rcAs = VioAssociate( hdc, gHvps );
+    if( gLog != 0 )
+        fprintf( gLog, "avio associate rc=%u\n", (unsigned) rcAs ),
+            fflush( gLog );
+    if( rcAs != 0 )
+        return False;
+
+    /* Ask for the cell before reading one: this box's engine default came
+       back 12x30 (measured, run eight), two steps scaled for a display
+       with the pixels doubled, and an 80x25 grid of it stood 968x805 --
+       taller than the whole 1024x768 screen, title bar off the top.  The
+       request is eFTE's WindowFont mechanism, its height-width spelling
+       (g_pm.cpp:2021..2026); 8x16 is the classic cell every theme was
+       designed on and the size the grid arithmetic below trusts.  What
+       the engine answers is still what gets believed. */
+    const USHORT rcSet = VioSetDeviceCellSize( kCellHReq, kCellWReq, gHvps );
+    if( gLog != 0 )
+        fprintf( gLog, "avio cell set rc=%u\n", (unsigned) rcSet ),
+            fflush( gLog );
+
+    /* The cell the engine actually has, believed on sight this time --
+       build five's diagonal drift was an assumed cell over a real font,
+       and this number is not an assumption, it is the engine's.  It
+       decides the frame size, the mouse mapping and the caret. */
+    SHORT cyChar = 0;
+    SHORT cxChar = 0;
+    const USHORT rcCell = VioGetDeviceCellSize( &cyChar, &cxChar, gHvps );
+    if( gLog != 0 )
+        fprintf( gLog, "avio cell rc=%u %ux%u\n", (unsigned) rcCell,
+                 (unsigned) cxChar, (unsigned) cyChar ), fflush( gLog );
+    if( cxChar >= kCellWMin && cxChar <= kCellWMax
+        && cyChar >= kCellHMin && cyChar <= kCellHMax )
+        {
+        gCellPxW = (ushort) cxChar;
+        gCellPxH = (ushort) cyChar;
+        }
+
+    // The page's own clear: the whole page, one scroll-up of blank
+    // attribute (0x07, light grey on black), exactly eFTE's WM_CREATE
+    // gesture (g_pm.cpp:2029) -- the BIOS idiom the page understands.
+    uchar blankAttr = kDefaultAttr;
+    const USHORT rcClr = VioScrollUp( 0, 0, (USHORT) -1, (USHORT) -1,
+                                      (USHORT) -1, &blankAttr,
+                                      (HVIO) gHvps );
+    if( rcClr != 0 && gLog != 0 )
+        fprintf( gLog, "avio clear rc=%u\n", (unsigned) rcClr ),
+            fflush( gLog );
+
+    gAvioOk = True;
+    return True;
 }
 
 static void pmOpenWindow()
@@ -966,12 +1123,21 @@ static void pmOpenWindow()
         return;
         }
 
-    // FCF_STANDARD without the shell's positioning (the window says where
-    // it goes) and without the maximize button (the grid is fixed, and a
-    // button that does nothing is a promise not kept).  The resources --
-    // icon above all, which the frame asks for by name and which a Watcom
-    // image does not have until rc appended them -- are id 256.
-    ULONG flFrame = (FCF_STANDARD & ~FCF_SHELLPOSITION & ~FCF_MAXBUTTON);
+    // The frame, asked for explicitly rather than as "standard minus a
+    // couple of things".  FCF_STANDARD (0xCC3F) requests MENU *and*
+    // accelerator resources by id, and their absence answers
+    // WinCreateStdWindow with PMERR_RESOURCE_NOT_FOUND, the window never
+    // being created at all (measured: atuipm's first run died exactly
+    // there).  Today the menu is wanted -- a real PM menu bar is the
+    // interface idiom, its items in atuipm.rc, their picks injected as
+    // keys (pmTakeCommand).  The accelerator table is not: every hot key
+    // the application has arrives as a plain WM_CHAR already, and a frame
+    // accelerator would take those combinations over the driver's head
+    // and double-answer them.  The maximize button stays gone for the
+    // same reason as always: the grid is fixed, and a button that does
+    // nothing is a promise not kept.
+    ULONG flFrame = (FCF_STANDARD & ~FCF_SHELLPOSITION & ~FCF_MAXBUTTON
+                     & ~FCF_ACCELTABLE);
     gFrame = WinCreateStdWindow( HWND_DESKTOP, 0, &flFrame,
                                  "AtuiApp", "atui",
                                  0, (HMODULE) 0, kIdWindow, &gClient );
@@ -986,10 +1152,11 @@ static void pmOpenWindow()
         }
     pmLog( "window ok" );
 
-    pmInitFont();
+    if( !pmInitAvio() )
+        pmLog( "avio unavailable: window stays blank" );
     if( gLog != 0 )
-        fprintf( gLog, "font %s cell %ux%u\n",
-                 gFontOk ? "ok" : "fallback",
+        fprintf( gLog, "page %s cell %ux%u\n",
+                 gAvioOk ? "ok" : "FAILED",
                  gCellPxW, gCellPxH ), fflush( gLog );
 
     // Size the frame so the client is the grid exactly.  Watcom's
@@ -1002,22 +1169,82 @@ static void pmOpenWindow()
     rcl.xRight = (LONG) gCols * (LONG) gCellPxW;
     rcl.yTop = (LONG) gRows * (LONG) gCellPxH;
     WinCalcFrameRect( gFrame, &rcl, 0 );
+    if( gLog != 0 )
+        fprintf( gLog, "grid %ux%u cell %ux%u frame %ldx%ld\n",
+                 gCols, gRows, gCellPxW, gCellPxH,
+                 (long) ( rcl.xRight - rcl.xLeft ), (long) ( rcl.yTop - rcl.yBottom ) ),
+            fflush( gLog );
     gClientW = (ulong) ((LONG) gCols * (LONG) gCellPxW);
     gClientH = (ulong) ((LONG) gRows * (LONG) gCellPxH);
-    WinSetWindowPos( gFrame, HWND_TOP, 40, 40,
-                     rcl.xRight - rcl.xLeft, rcl.yTop - rcl.yBottom,
+    /* Centre the frame on the screen rather than dropping it at a fixed
+       point: the box's display is 1024x768 with an icon bar, and a window
+       placed by its bottom-left corner at (40,40) with the engine's
+       generous cell ran its title bar off the top -- out of reach until
+       the user played title-bar hockey with hot keys (reported, and
+       screenshot4 shows why: 805 pixels of frame on a 768 pixel screen).
+       Centring from the real screen size keeps the whole frame visible
+       whenever it fits at all, and the clamps keep its corner on screen
+       when it does not.  The desktop window's rect is the screen: PM's
+       1.x idiom, and needed here anyway -- WinQuerySysInfo is absent from
+       Watcom's headers and import library both (measured), the same 1.x
+       vocabulary gap that cost the timers. */
+    RECTL scr;
+    WinQueryWindowRect( HWND_DESKTOP, &scr );
+    const LONG frameW = rcl.xRight - rcl.xLeft;
+    const LONG frameH = rcl.yTop - rcl.yBottom;
+    LONG x = (LONG) 40;
+    LONG y = (LONG) 40;
+    if( scr.xRight > frameW )
+        x = ( scr.xRight - frameW ) / 2;
+    if( scr.yTop > frameH )
+        y = ( scr.yTop - frameH ) / 2;
+    if( x < 2 )
+        x = 2;
+    if( y < 2 )
+        y = 2;
+    WinSetWindowPos( gFrame, HWND_TOP, x, y, frameW, frameH,
                      SWP_SIZE | SWP_MOVE | SWP_ACTIVATE | SWP_SHOW );
     WinSetFocus( HWND_DESKTOP, gClient );
     gPmUp = True;
     pmLog( "shown" );
-}
+
+    // The alarm thread: born last, because it posts to the window and must
+    // never meet one that is not there yet.  It is the timeout machinery of
+    // the wait, and nothing else; losing it (a thread the runtime could not
+    // start) leaves a window whose waits end on messages only -- late, but
+    // not deaf, and the log says so.
+    gWakeUp = True;
+    const int wakeRc = _beginthread( &pmWakeLoop, 0, (unsigned) kWakeStack, 0 );
+    if( wakeRc == -1 )
+        {
+        gWakeUp = False;
+        pmLogErr( "wake thread" );
+        }
+    else
+        gWakeTid = (unsigned) wakeRc;    // the runtime's handle; kept only to
+}                                        // say "there is a thread to wait out"
 
 static void pmCloseWindow()
 {
-    if( gHpsFont != 0 )
+    // The alarm stops first, and is waited out: gClient is about to go, and
+    // a post into a destroyed window is PM's error to shrug at -- better
+    // the thread simply never makes one.  The sleep is one pace plus a
+    // little; the thread checks gWakeUp after every sleep.
+    gWakeUp = False;
+    if( gWakeTid != 0 )
+        DosSleep( kIdleWakeMs + 100 );
+    if( gHvps != 0 )
         {
-        WinReleasePS( gHpsFont );
-        gHpsFont = 0;
+        // eFTE's order (g_pm.cpp:2032..2034): come off the DC, destroy
+        // the page, destroy the PS it was shown through.
+        VioAssociate( (HDC) 0, gHvps );
+        VioDestroyPS( gHvps );
+        gHvps = 0;
+        }
+    if( gHpsScreen != 0 )
+        {
+        GpiDestroyPS( gHpsScreen );
+        gHpsScreen = 0;
         }
     if( gFrame != 0 )
         {
@@ -1084,8 +1311,8 @@ THardwareInfo::~THardwareInfo()
 }
 
 //
-// Caret functions.  There is no caret in a window -- the cell's colours
-// swapped is the caret, so these are state plus one invalidate.
+// Caret functions.  The caret is PM's own (pmUpdateCaret); these keep the
+// state and call for it to be re-made in the new state.
 //
 
 ushort THardwareInfo::getCaretSize() noexcept
@@ -1107,8 +1334,7 @@ void THardwareInfo::setCaretSize( ushort size ) noexcept
         return;
     gCaretWasShown = shown;
     gCaretShown = (shown == 1);
-    if( gPmUp )
-        pmInvalidateWhole();      // v1: whole-window; caret-rect clips later
+    pmUpdateCaret();
 }
 
 void THardwareInfo::setCaretPosition( ushort x, ushort y ) noexcept
@@ -1119,8 +1345,7 @@ void THardwareInfo::setCaretPosition( ushort x, ushort y ) noexcept
     gCaretY = y;
     sbInfo.dwCursorPosition.X = (SHORT) x;
     sbInfo.dwCursorPosition.Y = (SHORT) y;
-    if( gCaretShown && gPmUp )
-        pmInvalidateWhole();
+    pmUpdateCaret();
 }
 
 //
@@ -1164,15 +1389,73 @@ void THardwareInfo::clearScreen( ushort, ushort ) noexcept
         pmInvalidateWhole();
 }
 
+/* One row's dirty runs, pushed to the page as cell strings.  The pair is
+   the video-memory order -- character first, attribute second -- which is
+   what the box measured (screenshot4: sent the other way round, the blank
+   spaces read as attribute 0x20, green-on-black, so the screen was a sea
+   of green, and every attribute byte came back as a CP850 control glyph
+   -- dotted confetti where the text should have been).  It is also eFTE's
+   in-memory order: its TCell is one unsigned short, and the little-endian
+   parts put the character at the low byte.  The page repaints what it
+   covers in the window it is associated with, which is why the dirty map
+   clears at the flush, the moment the truth leaves the shadow, and not
+   at the end of some later paint: after this call the page knows. */
+static void pmPushRow( ushort row )
+{
+    uchar cells[ 2 * 256 ];       // a span cannot exceed the widest grid
+    const size_t line = (size_t) row * gShadowCols;
+    ushort x = 0;
+    while( x < gShadowCols )
+        {
+        if( !gDirty[ line + x ] )
+            {
+            ++x;
+            continue;
+            }
+        const ushort first = x;
+        uchar *p = cells;
+        while( x < gShadowCols && gDirty[ line + x ]
+               && (size_t) ( p - cells ) + 2 <= sizeof( cells ) )
+            {
+            *p++ = gShadowCh[ line + x ];
+            *p++ = gShadowAttr[ line + x ];
+            ++x;
+            }
+        VioWrtCellStr( (PCH) cells, (USHORT) ( p - cells ),
+                       (USHORT) row, (USHORT) first, (HVIO) gHvps );
+        ++gPmRuns;
+        }
+}
+
 void THardwareInfo::flushScreen() noexcept
 {
     /* The frame ends here (the rule the VIO driver documents and the
        platform hardware.cpp follows): everything drawn since the last time
-       around reaches the screen in one paint, never as the fill-then-text
-       pair the classic writer makes of every repaint. */
-    if( gDirtyCount == 0 || gInvalidatePending )
+       around reaches the screen in one batch of cell strings, never as the
+       fill-then-text pair the classic writer makes of every repaint. */
+    if( gDirtyCount == 0 )
         return;
-    pmInvalidateWhole();
+    if( gHvps == 0 || gShadowCols != gCols || gShadowRows != gRows )
+        return;                 // nowhere to push; the shadow keeps the news
+    /* The caret goes away for the duration of the push and comes back
+       after it.  PM's caret is an inversion laid over the screen, and a
+       write that lands under it without hiding leaves the inverted pixels
+       when its own ink does not cover them -- a blank erases nothing, so
+       backspacing dragged the caret's white block along behind it
+       (screenshot5: a residue at every cell the caret rested on and only
+       blanks arrived at afterwards).  eFTE wraps every VioWrtCellStr that
+       can touch the caret's row in exactly this pair of calls
+       (g_pm.cpp:2871..2877 with 3196..3208); one pair around the whole
+       flush serves the same end here, the flush being this driver's one
+       writing moment. */
+    const Boolean caretWasShown = (Boolean) ( gCaretShown && gFocused );
+    if( caretWasShown )
+        WinShowCursor( gClient, FALSE );
+    for( ushort row = 0; row < gShadowRows; ++row )
+        pmPushRow( row );
+    forgetPending();
+    if( caretWasShown )
+        WinShowCursor( gClient, TRUE );
 }
 
 void THardwareInfo::redrawScreen() noexcept
@@ -1285,7 +1568,18 @@ BOOL THardwareInfo::getKeyEvent( TEvent& event ) noexcept
 }
 
 void THardwareInfo::waitForEvents( int timeoutMs ) noexcept
+    /* The first six entries and every 512th log: whether the application
+       keeps coming back to wait (alive, deaf queue) or left the loop and
+       is stuck somewhere else entirely -- PM build two logged the first
+       entry and then nothing, which could mean either. */
 {
+    static long gWaitCalls = 0;
+    ++gWaitCalls;
+    if( ( gWaitCalls <= 6 || gWaitCalls % 512 == 0 ) && gLog != 0 )
+        {
+        fprintf( gLog, "wait #%ld t=%d\n", gWaitCalls, timeoutMs );
+        fflush( gLog );
+        }
     flushScreen();
 
     /* The closed window asks the application to end, once; five seconds
@@ -1310,37 +1604,86 @@ void THardwareInfo::waitForEvents( int timeoutMs ) noexcept
         DosExit( EXIT_PROCESS, 0 );
         }
 
-    pumpMessages();
+    /* The wait proper is PM's own fetch -- the call every TOOLKIT sample
+       and eFTE spend their lives in.  DosSleep loops and peek-based polls
+       are what this driver invented instead, because the VIO driver it
+       mirrors has no window to serve; the box answered that design with a
+       window that never painted (atuipm.run.txt builds two and three).
+       WinGetMsg blocks on the queue, keeps the window manager answered
+       while blocked, generates the WM_PAINT an invalidated window is
+       asking for, and returns FALSE on WM_QUIT.  What it has no notion of
+       is a timeout -- PM timers are not in Watcom 1.9's vocabulary at all
+       -- and so the alarm thread posts the deadline into the queue, in
+       exactly the manner eFTE wakes its own blocked fetches. */
+
+    dispatchPending();
     if( anyInput() )
         return;
+    if( timeoutMs == 0 )
+        return;         // a pure poll: the queue said no, and no more
 
-    int waited = 0;
-    while( !anyInput() )
+    if( gWakeUp )       // the alarm keeps the cadence of the asking
+        gWakeMs = ( timeoutMs > 0 && timeoutMs < kIdleWakeMs )
+                    ? ( timeoutMs < kWakeMsMin
+                        ? (unsigned long) kWakeMsMin
+                        : (unsigned long) timeoutMs )
+                    : (unsigned long) kIdleWakeMs;
+
+    const uint64_t deadlineMs =
+        ( timeoutMs > 0 )
+            ? THardwareInfo::getTickCountMs() + (uint64_t) timeoutMs
+            : (uint64_t) 0;
+
+    while( !anyInput() && !gInterruptWait )
         {
-        if( gInterruptWait )
-            break;
-        if( timeoutMs >= 0 && waited >= timeoutMs )
-            break;
-        DosSleep( kPollMs );
-        waited += kPollMs;
-        pumpMessages();
-        // A window closed during the wait has already been answered with
-        // the injected Alt-X; its deadline is watched from here too, in
-        // the sleeping loop and not by breaking out of it -- an
-        // application deaf to the injection and idle at that would
-        // otherwise spin the CPU at full tilt next to a dead window.
-        if( gClosed
-            && THardwareInfo::getTickCountMs() - gClosedMs >= (uint64_t) kQuitForceMs )
+        QMSG q;
+        if( !WinGetMsg( gHab, &q, NULLHANDLE, 0, 0 ) )
             {
-            pmLog( "force exit" );
-            DosExit( EXIT_PROCESS, 0 );
+            gClosed = True;   // FALSE is WM_QUIT (eFTE: return -1)
+            if( gClosedMs == 0 )
+                gClosedMs = THardwareInfo::getTickCountMs();
+            break;
             }
+        if( q.msg == kWmWake )
+            {
+            // The alarm: it owns the deadline, and the closed window's
+            // five seconds -- a windowful of messages can be what never
+            // arrives, and an application deaf to the injected Alt-X must
+            // not leave a dead window and a blocked thread forever.
+            if( deadlineMs != 0
+                && THardwareInfo::getTickCountMs() >= deadlineMs )
+                break;
+            if( gClosed
+                && THardwareInfo::getTickCountMs() - gClosedMs
+                       >= (uint64_t) kQuitForceMs )
+                {
+                pmLog( "force exit" );
+                DosExit( EXIT_PROCESS, 0 );
+                }
+            continue;
+            }
+        if( !deliverMessage( q ) )
+            break;
         }
     gInterruptWait = False;
 }
 
 void THardwareInfo::interruptEventWait() noexcept
 {
+    /* Flag only, and the flag is answered by the next alarm tick: ten-odd
+       milliseconds when the application was waiting short because work is
+       streaming -- which is the only moment this call matters -- and a
+       quarter second when it was waiting on nothing in particular, which
+       is exactly when nobody needed waking.
+
+       eFTE's PipeThread proves that a worker can post the wake directly:
+       it WinInitialize's on entry and WinTerminate's on exit
+       (g_pm.cpp:4359..4426).  atui's workers have no such handshake --
+       they are runtime threads that know sockets, not PM -- and bolting a
+       per-thread WinInitialize onto this call with thread-local state is
+       a machine this driver does not need while the alarm is already
+       running.  If a future wait ever has to be answered in less than a
+       tick, that is where it belongs. */
     gInterruptWait = True;
 }
 
@@ -1369,10 +1712,9 @@ uint64_t THardwareInfo::getTickCountMs() noexcept
 }
 
 /* The same three numbers the application logs for the VIO driver: the
-   writes that went out (runs of cells painted -- fill and ink each count,
-   as the kernel counts), the frames that replaced a scroll (PM has no
-   scroll shortcut: a painted frame is the scroll), and what the last
-   paint cost, which is the number the repaint interval is shaped from. */
+   cell strings pushed to the page, the whole re-shows the window asked
+   for, and what the last one cost -- the number the repaint interval is
+   shaped from. */
 extern "C" {
 
 unsigned long tvVioStatCalls()   { return gPmRuns; }
