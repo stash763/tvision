@@ -123,6 +123,8 @@
 #include <stdlib.h>
 #include <process.h>        // _beginthread, for the wake thread
 
+#include "tui/pmdialogs.h"  // the kit: pmDialogsInstall(), gPmDialogs
+
 /* W869 ("_beginthread requires the build target to be multi-threaded")
    speaks of a runtime this program is not: core/thread_os2.cpp measured
    both runtimes on the box and found the Watcom OS/2 32-bit one upgrades
@@ -645,6 +647,13 @@ static void pmTakeChar( ULONG flags, short ch, ushort virt, uchar scan )
    them in step stays possible.  Switch model is absent on purpose: its
    submenu's contents are app-side knowledge, and it arrives with the
    PM-side menu building that the native-dialog phase brings. */
+/* pmdlg.cpp hangs its dialogs off the frame; the frame is this file's, and
+   that one line is the whole of what it needs to know about it. */
+HWND pmFrameWindow( void )
+{
+    return gFrame;
+}
+
 static void pmTakeCommand( int id )
 {
     struct CommandKey
@@ -1152,6 +1161,11 @@ static void pmOpenWindow()
         return;
         }
     pmLog( "window ok" );
+
+    // The window makes the native dialogs possible: hand them to the
+    // application now (src/tui/pmdialogs.h), before the first paint and
+    // before any event that could open one.
+    pmDialogsInstall();
 
     if( !pmInitAvio() )
         pmLog( "avio unavailable: window stays blank" );
