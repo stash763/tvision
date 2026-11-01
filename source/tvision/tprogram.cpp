@@ -357,21 +357,29 @@ void TProgram::resizeScreen( ushort w, ushort h )
     TScreen::clearScreen();
     buffer = TScreen::screenBuffer;
 
-    // Bounds first, all of them, drawn once at the end.  changeBounds
-    // would draw every view at the moment its own box changes: the tree
-    // caught mid-move, children outside a parent that has not moved
-    // yet, a whole-screen write of a buffer that only the last view of
-    // the pass has filled.  setBounds moves in silence; redraw draws the
-    // finished tree once, top to bottom, which is the only moment the
-    // result is meant to be seen.
+    // changeBounds, not setBounds -- and this is the bug this comment
+    // pays for: setBounds moves in silence, and silence was wrong here.
+    // TGroup::changeBounds keeps the tree's drawing truth in step when
+    // the size actually changes (clip = the full extent, then every
+    // child's rect recomputed and its own changeBounds recursed); skip
+    // it and the children go on drawing into the clip rect of the old
+    // screen, which after a grow is nothing at all -- prompt and status
+    // line vanished, measured on the box.
+    //
+    // The desktop's rect excludes the status row: that is the geometry
+    // the app's own layout was built against, and it is what keeps the
+    // desktop from ever reaching over the status line's row. The status
+    // line is moved last, so whatever order the drawing falls out in,
+    // its row is painted after the desktop covered the screen with
+    // blanks.
     TRect r( 0, 0, w, h );
+    changeBounds( r );                          // the application group
     if( menuBar )
-        menuBar->setBounds( TRect( 0, 0, w, 1 ) );
+        menuBar->changeBounds( TRect( 0, 0, w, 1 ) );
     if( deskTop )
-        deskTop->setBounds( r );
+        deskTop->changeBounds( TRect( 0, 0, w, h - 1 ) );
     if( statusLine )
-        statusLine->setBounds( TRect( 0, h-1, w, h ) );
-    setBounds( r );
+        statusLine->changeBounds( TRect( 0, h-1, w, h ) );
     setState( sfExposed, False );
     setState( sfExposed, True );
     redraw();

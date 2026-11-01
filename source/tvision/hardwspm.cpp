@@ -287,6 +287,26 @@ static HPS    gHpsScreen = 0;   // the PS built on the window's DC and
 static HVPS   gHvps      = 0;   // the AVIO page: a BIOS text screen that
                                 // remembers its cells and shows them in
                                 // the window it is associated to
+/* The native vertical scrollbar -- eFTE's answer to the wheel (its
+   g_pm.cpp:1454 creates the same WC_SCROLLBAR class the same way), and
+   the user's own account of this OS: the wheel is a specialized driver
+   that scrolls the scroll bar under the pointer, so a window without a
+   bar cannot be wheeled at all.  The page shrinks by the bar's width;
+   the snap arithmetic knows, the mouse never notices (the bar eats its
+   own messages). */
+static HWND   gSbar      = 0;
+static LONG   gSbW       = 0;   // pixels the bar takes (SV_CXVSCROLL)
+static int    gVsbLogs   = 0;   // the bar's first twelve WM_VSCROLLs
+
+/* The transcript is app knowledge; the bar is the driver's.  app.cpp
+   (src/tui) implements the first two -- extent of the line list, and a
+   jump when the thumb moves -- and calls the driver's pmSyncScrollBar
+   from its relayout tick with the third.  A three-line conversation is
+   the whole of the seam. */
+extern "C" {
+void pmTranscriptExtent( int *total, int *view, int *pos );
+void pmTranscriptJump( int line );
+}
 static Boolean gAvioOk   = False;
 static Boolean gPmUp    = False; // window + queue exist; drawing is legal
 static Boolean gClosed  = False; // the user closed the window
@@ -372,7 +392,10 @@ static unsigned long gPmPaintMs = 0;
    each: those are the events whose absence means the window exists but is
    deaf or blind, which is otherwise invisible. */
 static FILE *gLog = 0;
-static Boolean gKeyLogged = False;
+static int gKeyLogs = 0;                // the first thirty keys delivered:
+                                        // the story of PgUp is written here
+                                        // -- char, virt, scan and flags --
+                                        // and a one-line cap told nothing
 static Boolean gFocusInLogged = False;    // which window answers focus, and
 static Boolean gFocusOutLogged = False;   // whether the pointer is heard
 static Boolean gMouseLogged = False;      // at all, each logged once
@@ -625,6 +648,83 @@ static void pmWheelScroll( Boolean up )
     putMouse( mouse );
 }
 
+/* A page step from the bar becomes the very key the application already
+   answers on its own: PgUp and PgDn travel the injected-key road the
+   menu picks travel (pmTakeCommand's fillKey), the scans BIOS's own --
+   0x49 and 0x51.  One slot, one page: the app's interceptor pages the
+   transcript, and whatever the injected key replaces was a page nobody
+   double-turned. */
+static void pmInjectPage( int down )
+{
+    fillKey( gPendingKey, 0, (uchar) (down ? 0x51 : 0x49), 0 );
+    gKeyPending = True;
+}
+
+/* The thumb follows the transcript: every turn of the driver's own pump
+   asks the app how far the line list reaches and where the view sits in
+   it -- the same 50 ms beat the window already wakes on, from the thread
+   that owns the window, so no hook into app.cpp's idle loop and no call
+   the console build would have to link.  eFTE's arithmetic sets the
+   thumb -- its g_pm.cpp:3107, above 32767 lines scaled and below them
+   lines at a time, hidden entirely when everything already fits.  The
+   unchanged-value guard is not politeness: a scrollbar told the same
+   thing twenty times a second is a scrollbar redrawing twenty times. */
+static void pmSyncScrollBar()
+{
+    if( gSbar == 0 )
+        return;
+    int total = 0, view = 0, pos = 0;
+    pmTranscriptExtent( &total, &view, &pos );
+    if( total < 0 )
+        total = 0;
+    if( view < 1 )
+        view = 1;
+    if( pos < 0 )
+        pos = 0;
+    static int lastTotal = -1, lastView = -1, lastPos = -1;
+    if( total == lastTotal && view == lastView && pos == lastPos )
+        return;
+    lastTotal = total; lastView = view; lastPos = pos;
+
+    WinEnableWindowUpdate( gSbar, FALSE );     // eFTE: one repaint for
+    if( total > view )                         // the pair of sets, not
+        {                                      // two
+        if( total > 32767 )
+            {
+            LONG mult = (LONG) total / 32767;
+            if( mult * 32767 != (LONG) total )
+                ++mult;
+            if( mult < 1 )
+                mult = 1;
+            LONG amount = (LONG) (32767L * (long) view / (long) total);
+            if( amount < 1 )
+                amount = 1;
+            WinSendMsg( gSbar, SBM_SETTHUMBSIZE,
+                        MPFROM2SHORT( (short) amount, (short) 32767 ), 0 );
+            WinSendMsg( gSbar, SBM_SETSCROLLBAR,
+                        MPFROMSHORT( (short) ((LONG) pos / mult) ),
+                        MPFROM2SHORT( (short) 1,
+                                      (short) ((LONG) (total + 1) / mult) ) );
+            }
+        else
+            {
+            WinSendMsg( gSbar, SBM_SETTHUMBSIZE,
+                        MPFROM2SHORT( (short) view, (short) total ), 0 );
+            WinSendMsg( gSbar, SBM_SETSCROLLBAR,
+                        MPFROMSHORT( (short) (pos + 1) ),
+                        MPFROM2SHORT( (short) 1,
+                                      (short) (total - view + 2) ) );
+            }
+        }
+    else
+        {
+        WinSendMsg( gSbar, SBM_SETTHUMBSIZE, MPFROM2SHORT( 0, 0 ), 0 );
+        WinSendMsg( gSbar, SBM_SETSCROLLBAR, MPFROMSHORT( 0 ),
+                    MPFROM2SHORT( 0, 0 ) );
+        }
+    WinEnableWindowUpdate( gSbar, TRUE );
+}
+
 /*
  * The keyboard.
  *
@@ -723,13 +823,14 @@ static void pmTakeChar( ULONG flags, short ch, ushort virt, uchar scan )
     fillKey( event, chB, scanB, modifiers );
     if( event.keyDown.keyCode == kbNoKey )
         return;     // a pair no name resolves -- drop it, do not deliver it
-    if( !gKeyLogged )
+    if( gKeyLogs < 30 )
         {
-        gKeyLogged = True;    // the probe never confirmed keyboard delivery;
-        if( gLog != 0 )       // this line is that confirmation, once
-            fprintf( gLog, "key char=0x%02X virt=0x%04X scan=0x%02X mods=0x%04X\n",
+        ++gKeyLogs;         // the probe once needed one line; telling
+        if( gLog != 0 )     // PgUp from nothing needs the stream
+            fprintf( gLog,
+                     "key char=0x%02X virt=0x%04X scan=0x%02X mods=0x%04X flags=0x%04X\n",
                      (unsigned) chB, (unsigned) virt, (unsigned) scanB,
-                     (unsigned) modifiers ), fflush( gLog );
+                     (unsigned) modifiers, (unsigned) flags ), fflush( gLog );
         }
     gPendingKey = event;
     gKeyPending = True;
@@ -944,7 +1045,10 @@ static void pmSnapSWP( HWND hwndFrame, PSWP pswp )
     WinCalcFrameRect( hwndFrame, &r0, TRUE );
     LONG cw = r0.xRight - r0.xLeft;
     LONG ch = r0.yTop - r0.yBottom;
-    ushort cols = (ushort) ( cw / (LONG) gCellPxW );
+    /* The bar's column is pixels the grid never sees -- the same
+       deduction WM_SIZE makes, so the two windows agree on what the
+       client's cells are. */
+    ushort cols = (ushort) ((cw - gSbW) / (LONG) gCellPxW);
     ushort rows = (ushort) ( ch / (LONG) gCellPxH );
     if( cols < kMinCols )
         cols = kMinCols;
@@ -954,7 +1058,7 @@ static void pmSnapSWP( HWND hwndFrame, PSWP pswp )
     RECTL r1;
     r1.xLeft = 0;
     r1.yBottom = 0;
-    r1.xRight = (LONG) cols * (LONG) gCellPxW;
+    r1.xRight = (LONG) cols * (LONG) gCellPxW + gSbW;
     r1.yTop = (LONG) rows * (LONG) gCellPxH;
     WinCalcFrameRect( hwndFrame, &r1, FALSE );
     LONG newCx = r1.xRight - r1.xLeft;
@@ -1026,9 +1130,19 @@ static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
             gClientW = (ulong) ( rect.xRight - rect.xLeft );
             gClientH = (ulong) ( rect.yTop - rect.yBottom );
 
+            /* The bar rides the right edge at full height -- PM counts
+               from the bottom left, and the bar takes exactly that
+               column of pixels the grid arithmetic below deducts. */
+            if( gSbar != 0 )
+                WinSetWindowPos( gSbar, 0,
+                                 (LONG) gClientW - gSbW, 0, gSbW,
+                                 (LONG) gClientH,
+                                 SWP_SIZE | SWP_MOVE | SWP_SHOW );
+
             if( gAvioOk )
                 {
-                ushort cols = (ushort) ( gClientW / gCellPxW );
+                ushort cols = (ushort) ( ((LONG) gClientW - gSbW)
+                                         / (LONG) gCellPxW );
                 ushort rows = (ushort) ( gClientH / gCellPxH );
                 if( cols < kMinCols )
                     cols = kMinCols;
@@ -1195,37 +1309,71 @@ static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
 
     case WM_TRANSLATEACCEL:
         {
-        /* Warp 4 does not send the wheel as a message of its own; it asks
-           the window to translate an accelerator, WM_TRANSLATEACCEL --
-           the capture net named this one (seven rolls, seven arrivals at
-           this window; kWmMouseWheel above has never once spoken).  The
-           mp2 flags say what the wheel did, and their bit layout lives in
-           no header on this machine and no line of eFTE: the twelve
-           logged rolls settle it.  The guess below is the staircase the
-           community headers repeat -- WOW_SCROLLUP 0x2000, WOW_SCROLLDOWN
-           0x4000, WOW_SCROLLEND 0x0040, WOW_SCROLLHOR 0x0080 -- and if
-           the log shows the bits elsewhere, the two lines of the guess
-           are where the correction lands.  Horizontal rolls and the end
-           of a scroll burst pass through untranslated, which is what
-           "do nothing" means here. */
-        const ULONG fl = (ULONG) SHORT1FROMMP( mp2 );
-        if( gAccelLogs < 12 && gLog != 0 )
+        /* The accelerator request, 0x004b (header-confirmed) -- the
+           message the capture net caught seven times under a rolling
+           wheel.  Reading mp2 as flags showed only zeros (measured);
+           eFTE's handler (g_pm.cpp:1556) says why: mp1 is a QMSG
+           pointer, and the event the wheel really sent rides behind it.
+           Log the wrapped message twelve times -- msg, vk, ch, flags --
+           and answer nothing here: the native scrollbar along the
+           window's right edge is what this box's wheel driver scrolls,
+           and its WM_VSCROLL is the deterministic path.  If the log
+           shows the wheel wrapping vk codes the bar never got, these
+           four lines become arrows and pages next round. */
+        const QMSG *q = (const QMSG *) PVOIDFROMMP( mp1 );
+        if( gAccelLogs < 12 && gLog != 0 && q != 0 )
             {
             ++gAccelLogs;
-            fprintf( gLog, "wheelacc a=%d b=%d c=%d d=0x%04X\n",
-                     (int) (short) SHORT1FROMMP( mp1 ),
-                     (int) (short) SHORT2FROMMP( mp1 ),
-                     (int) (short) SHORT2FROMMP( mp2 ),
-                     (unsigned) (SHORT1FROMMP( mp2 )) );
+            fprintf( gLog, "acc msg=0x%lx vk=0x%04X ch=0x%04X fl=0x%04X\n",
+                     (unsigned long) q->msg,
+                     (unsigned) SHORT2FROMMP( q->mp2 ),
+                     (unsigned) SHORT1FROMMP( q->mp2 ),
+                     (unsigned) SHORT1FROMMP( q->mp1 ) );
             fflush( gLog );
             }
-        if( (fl & 0x0080L) != 0 )       // WOW_SCROLLHOR: no horizontal
-            break;                      // scroll to speak of
-        if( (fl & 0x0040L) != 0 )       // WOW_SCROLLEND: the burst is over
+        break;
+        }
+
+    /* The bar speaks: WM_VSCROLL arrives from the child scrollbar with
+       eFTE's parameter shape (its g_pm.cpp:2474 -- the SB_* code is
+       mp2's high short, the thumb position its low).  Line steps are
+       wheel notches -- settings::wheelLines scales them in the app;
+       page steps are the keys the app already pages with; the thumb
+       jumps the transcript directly, one-based numbers becoming the
+       app's zero-based lines.  SBS_AUTOTRACK makes drags talk live, and
+       the same door admits the wheel driver, which scrolls bars like
+       this one and nothing else. */
+    case WM_VSCROLL:
+        {
+        const short code = (short) SHORT2FROMMP( mp2 );
+        const short pos  = (short) SHORT1FROMMP( mp2 );
+        if( gVsbLogs < 12 && gLog != 0 )
+            {
+            ++gVsbLogs;
+            fprintf( gLog, "vsb code=%d pos=%d\n", (int) code, (int) pos );
+            fflush( gLog );
+            }
+        switch( code )
+            {
+        case SB_LINEUP:
+            pmWheelScroll( True );
             break;
-        if( (fl & 0x2000L) == 0 && (fl & 0x4000L) == 0 )
-            break;                      // no direction the guess knows
-        pmWheelScroll( (fl & 0x2000L) != 0 );
+        case SB_LINEDOWN:
+            pmWheelScroll( False );
+            break;
+        case SB_PAGEUP:
+            pmInjectPage( 0 );
+            break;
+        case SB_PAGEDOWN:
+            pmInjectPage( 1 );
+            break;
+        case SB_SLIDERPOSITION:
+        case SB_SLIDERTRACK:
+            pmTranscriptJump( (int) pos - 1 );
+            break;
+        default:                        // ENDSCROLL and friends: the
+            break;                      // view is already where they say
+        }
         return 0;
         }
 
@@ -1636,6 +1784,24 @@ static void pmOpenWindow()
     // before any event that could open one.
     pmDialogsInstall();
 
+    /* The scrollbar, eFTE's recipe verbatim (g_pm.cpp:1454): the class,
+       the styles, the zero rect -- WM_SIZE below lays it out the way it
+       lays out everything else.  SBS_AUTOTRACK so a dragged thumb talks
+       as it moves; owner is the client, and to the client its WM_VSCROLL
+       comes.  How many pixels the bar takes, the system says. */
+    gSbW = (LONG) WinQuerySysValue( HWND_DESKTOP, SV_CXVSCROLL );
+    if( gSbW < 0 )
+        gSbW = 0;
+    gSbar = WinCreateWindow( gClient, WC_SCROLLBAR, "",
+                             WS_VISIBLE | SBS_VERT | SBS_AUTOTRACK,
+                             0, 0, 0, 0, gClient, HWND_TOP,
+                             0, NULL, NULL );
+    if( gSbar == 0 )
+        {
+        pmLogErr( "scrollbar create" );
+        gSbW = 0;    // nothing to reserve if there is nothing to draw
+        }
+
     if( !pmInitAvio() )
         pmLog( "avio unavailable: window stays blank" );
     if( gLog != 0 )
@@ -1650,8 +1816,8 @@ static void pmOpenWindow()
     RECTL rcl;
     rcl.xLeft = 0;
     rcl.yBottom = 0;
-    rcl.xRight = (LONG) gCols * (LONG) gCellPxW;
-    rcl.yTop = (LONG) gRows * (LONG) gCellPxH;
+    rcl.xRight = (LONG) gCols * (LONG) gCellPxW + gSbW;   // page plus the
+    rcl.yTop = (LONG) gRows * (LONG) gCellPxH;            // bar's column
     WinCalcFrameRect( gFrame, &rcl, 0 );
     if( gLog != 0 )
         fprintf( gLog, "grid %ux%u cell %ux%u frame %ldx%ld\n",
@@ -1723,9 +1889,10 @@ static void pmCloseWindow()
     pmTeardownPage();
     if( gFrame != 0 )
         {
-        WinDestroyWindow( gFrame );
-        gFrame = 0;
-        gClient = 0;
+        WinDestroyWindow( gFrame );   // the scrollbar child goes with
+        gFrame = 0;                   // the window, as PM arranges;
+        gClient = 0;                  // forget the handle, do not post
+        gSbar = 0;                    // into it ever again
         }
     if( gHmq != 0 )
         {
@@ -2086,6 +2253,10 @@ void THardwareInfo::waitForEvents( int timeoutMs ) noexcept
         gPendResize = False;
         pmResizeTo( gPendRows, gPendCols );
         }
+
+    /* The thumb keeps pace with the transcript on this same beat;
+       pmSyncScrollBar is quiet when nothing moved. */
+    pmSyncScrollBar();
 
     /* The closed window asks the application to end, once; five seconds
        later the asking stops and the process does.  The flag is earned by
