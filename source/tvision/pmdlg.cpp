@@ -81,6 +81,15 @@ enum
     kCtlModelList    = 403
 };
 
+/* "This one was shown": WM_INITDLG only runs on a dialog that made it to
+   the screen, so it is the proof the box itself cannot give -- a WinDlgBox
+   that fails to load its template and a dialog the user cancelled both
+   come back as zero.  Cancel is an answer, handled; failure to appear is
+   not, and only that is worth the tvision fallback.  One flag serves
+   both dialogs: they are never up together -- each runs its own modal
+   loop, and the count in the driver says so. */
+static int gDlgShown = 0;
+
 /* ------------------------------------------------------------------ theme */
 
 MRESULT EXPENTRY pmThemeDlgProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
@@ -94,6 +103,7 @@ MRESULT EXPENTRY pmThemeDlgProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
         if( pmThemeCurrent() == 0 )
             WinSendDlgItemMsg( hwnd, kCtlThemeClassic, BM_SETCHECK,
                                MPVOID, MPVOID );
+        gDlgShown = 1;          // on screen: the wrapper's proof
         return 0;
 
     case WM_COMMAND:
@@ -120,12 +130,18 @@ MRESULT EXPENTRY pmThemeDlgProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
 
 static int pmThemeDialog( void )
 {
-    // WinDismissDlg's TRUE is what WinDlgBox hands back; DID_OK is 1.
+    // The dialog applies the theme itself (pmThemeApply from its own
+    // WM_COMMAND); the return value only says whether the PM front had
+    // this one, and shown is the answer -- cancel included, which is
+    // why == DID_OK was wrong: it called an honest "no thanks" a
+    // failure and the caller then drew the tvision dialog after it.
     // pmNoteDialog (hardwspm.cpp) counts the modal loops: the driver
     // defers any resize that arrives while one is running.
     pmNoteDialog( +1 );
-    const int shown = WinDlgBox( HWND_DESKTOP, pmFrameWindow(), pmThemeDlgProc,
-                                 0, kDlgTheme, NULL ) == DID_OK;
+    gDlgShown = 0;
+    WinDlgBox( HWND_DESKTOP, pmFrameWindow(), pmThemeDlgProc,
+               0, kDlgTheme, NULL );
+    const int shown = gDlgShown;
     pmNoteDialog( -1 );
     return shown;
 }
@@ -166,6 +182,7 @@ MRESULT EXPENTRY pmSwitchModelDlgProc( HWND hwnd, ULONG msg,
             WinSendDlgItemMsg( hwnd, kCtlModelList, LM_SELECTITEM,
                                MPFROMSHORT( (short) active ),
                                MPFROMSHORT( TRUE ) );
+        gDlgShown = 1;          // on screen: the wrapper's proof
         return 0;
         }
 
@@ -203,8 +220,10 @@ static int pmSwitchModelDialog( void )
     if( pmModelCount() == 0 )
         return 0;
     pmNoteDialog( +1 );
-    const int shown = WinDlgBox( HWND_DESKTOP, pmFrameWindow(), pmSwitchModelDlgProc,
-                                 0, kDlgSwitchModel, NULL ) == DID_OK;
+    gDlgShown = 0;
+    WinDlgBox( HWND_DESKTOP, pmFrameWindow(), pmSwitchModelDlgProc,
+               0, kDlgSwitchModel, NULL );
+    const int shown = gDlgShown;
     pmNoteDialog( -1 );
     return shown;
 }

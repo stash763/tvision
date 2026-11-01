@@ -357,14 +357,21 @@ void TProgram::resizeScreen( ushort w, ushort h )
     TScreen::clearScreen();
     buffer = TScreen::screenBuffer;
 
+    // Bounds first, all of them, drawn once at the end.  changeBounds
+    // would draw every view at the moment its own box changes: the tree
+    // caught mid-move, children outside a parent that has not moved
+    // yet, a whole-screen write of a buffer that only the last view of
+    // the pass has filled.  setBounds moves in silence; redraw draws the
+    // finished tree once, top to bottom, which is the only moment the
+    // result is meant to be seen.
     TRect r( 0, 0, w, h );
-    changeBounds( r );
     if( menuBar )
-        menuBar->changeBounds( TRect( 0, 0, w, 1 ) );
+        menuBar->setBounds( TRect( 0, 0, w, 1 ) );
     if( deskTop )
-        deskTop->changeBounds( r );
+        deskTop->setBounds( r );
     if( statusLine )
-        statusLine->changeBounds( TRect( 0, h-1, w, h ) );
+        statusLine->setBounds( TRect( 0, h-1, w, h ) );
+    setBounds( r );
     setState( sfExposed, False );
     setState( sfExposed, True );
     redraw();

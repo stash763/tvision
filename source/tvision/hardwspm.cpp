@@ -275,6 +275,12 @@ static PFNWP  gOldFrameProc = 0;  // the standard frame's own procedure,
                                   // kept to chain to from ours (eFTE's
                                   // oldFrameProc, g_pm.cpp:189, 2304)
 static HWND   gClient   = 0;
+static HDC    gHdc       = 0;   // the window's DC the PS and the page are
+                                // built on; WinOpenWindowDC is a counted
+                                // open and every resize that forgot to
+                                // WinCloseDC leaked one -- thirty-five
+                                // drags later the dialogs stopped being
+                                // able to draw
 static HPS    gHpsScreen = 0;   // the PS built on the window's DC and
                                 // associated with the page (GPIA_ASSOC);
                                 // WinBeginPaint is handed it, eFTE's way
@@ -376,6 +382,12 @@ static Boolean gFrameAdjustLogged = False;    // ... at either window
 static int gUnknownMsgs = 0;              // the capture net: forty at most
 static int gWheelLogs = 0;                // the wheel: its first few raw
                                           // messages, then silence
+static int gAccelLogs = 0;                // WM_TRANSLATEACCEL: twelve raw
+                                          // parameter rolls -- the wheel
+                                          // flags are in no header here
+static LONG gMousePx = 0;                 // the pointer's last reported
+static LONG gMousePy = 0;                 // pixel, for the wheel case
+static Boolean gMouseSeen = False;        // that never carries a position
 
 static void pmLog( const char *what )
 {
@@ -570,6 +582,49 @@ static void putMouse( const MouseEventType &mouse )
     gMouseQueue[ tail ] = mouse;
 }
 
+/* A wheel notch becomes the event the application already speaks: the
+   transcript's own handler counts notches into lines (wheelLines) and
+   the VIO front delivers exactly this shape.  WM_TRANSLATEACCEL is an
+   accelerator request and carries no position -- the keyboard never
+   has one -- so the pointer's last reported pixel stands in, and
+   before any move has been seen at all the middle of the grid, where
+   the transcript always lives. */
+static void pmWheelScroll( Boolean up )
+{
+    LONG px, py;
+    if( gMouseSeen )
+        {
+        px = gMousePx;
+        py = gMousePy;
+        }
+    else
+        {
+        px = ((LONG) gCols * (LONG) gCellPxW) / 2;
+        py = ((LONG) gRows * (LONG) gCellPxH) / 2;
+        }
+    if( px < 0 )
+        px = 0;
+    if( py < 0 )
+        py = 0;
+    MouseEventType mouse;
+    fillMouse( mouse,
+               (int) (px / (LONG) gCellPxW),
+               (int) (((LONG) gClientH - 1 - py) / (LONG) gCellPxH),
+               gMouseButtons,
+               0,                    // a notch is an event, not a motion
+               up ? mwUp : mwDown,
+               0 );
+    if( mouse.where.x < 0 )
+        mouse.where.x = 0;
+    if( mouse.where.y < 0 )
+        mouse.where.y = 0;
+    if( mouse.where.x >= (int) gCols )
+        mouse.where.x = (int) gCols - 1;
+    if( mouse.where.y >= (int) gRows )
+        mouse.where.y = (int) gRows - 1;
+    putMouse( mouse );
+}
+
 /*
  * The keyboard.
  *
@@ -644,7 +699,15 @@ static void pmTakeChar( ULONG flags, short ch, ushort virt, uchar scan )
     // pair tkeys.h names them by.  A key that is both named and printable
     // (Enter arrives so) still prefers the table: the tables scan is the
     // one kbEnter compares equal to.
-    uchar chTry = chB;
+    //
+    // A named key therefore discards whatever byte rode along: PageUp on
+    // this PM arrives in WM_CHAR carrying 0x11 -- XON, the control code
+    // that historically *was* PageUp -- and delivering it turned the pair
+    // into 0x4911, a key no name resolves, whose stray byte the prompt
+    // then ate (measured: PgUp typing instead of paging, and the same
+    // class covers the arrows and Home/End).  pmVirtualKey supplies the
+    // characters the named keys really do have -- Esc, Enter, BS, Tab.
+    uchar chTry = (virt != 0) ? 0 : chB;
     uchar scanTry = scanB;
     if( pmVirtualKey( virt, chTry, scanTry, modifiers ) )
         {
@@ -797,6 +860,14 @@ static void pmTeardownPage()
         GpiDestroyPS( gHpsScreen );
         gHpsScreen = 0;
         }
+    /* gHdc is not touched, and that is deliberate, not forgotten: its
+       pair WinCloseDC is Warp 4's late addition and exists in no header
+       this compiler ships (measured -- pmwin.h knows the open only),
+       and eFTE, the pattern for this whole window, opens its DC at
+       birth and never closes it (g_pm.cpp:2014, one mention, no more).
+       What matters is one DC per window instead of one per drag: the
+       page is what gets torn down and rebuilt here, the DC lives as
+       long as the window and goes when the process does. */
 }
 
 static void pmResizeTo( ushort rows, ushort cols )
@@ -1051,6 +1122,9 @@ static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
                 py = 0;
             if( py >= (long) gClientH )
                 py = (long) gClientH - 1;
+            gMousePx = px;                // the wheel's substitute point,
+            gMousePy = py;                // see pmWheelScroll
+            gMouseSeen = True;
             MouseEventType mouse;
             fillMouse( mouse,
                        (int) (px / (long) gCellPxW),
@@ -1116,6 +1190,42 @@ static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
         if( mouse.where.y >= (int) gRows )
             mouse.where.y = (int) gRows - 1;
         putMouse( mouse );
+        return 0;
+        }
+
+    case WM_TRANSLATEACCEL:
+        {
+        /* Warp 4 does not send the wheel as a message of its own; it asks
+           the window to translate an accelerator, WM_TRANSLATEACCEL --
+           the capture net named this one (seven rolls, seven arrivals at
+           this window; kWmMouseWheel above has never once spoken).  The
+           mp2 flags say what the wheel did, and their bit layout lives in
+           no header on this machine and no line of eFTE: the twelve
+           logged rolls settle it.  The guess below is the staircase the
+           community headers repeat -- WOW_SCROLLUP 0x2000, WOW_SCROLLDOWN
+           0x4000, WOW_SCROLLEND 0x0040, WOW_SCROLLHOR 0x0080 -- and if
+           the log shows the bits elsewhere, the two lines of the guess
+           are where the correction lands.  Horizontal rolls and the end
+           of a scroll burst pass through untranslated, which is what
+           "do nothing" means here. */
+        const ULONG fl = (ULONG) SHORT1FROMMP( mp2 );
+        if( gAccelLogs < 12 && gLog != 0 )
+            {
+            ++gAccelLogs;
+            fprintf( gLog, "wheelacc a=%d b=%d c=%d d=0x%04X\n",
+                     (int) (short) SHORT1FROMMP( mp1 ),
+                     (int) (short) SHORT2FROMMP( mp1 ),
+                     (int) (short) SHORT2FROMMP( mp2 ),
+                     (unsigned) (SHORT1FROMMP( mp2 )) );
+            fflush( gLog );
+            }
+        if( (fl & 0x0080L) != 0 )       // WOW_SCROLLHOR: no horizontal
+            break;                      // scroll to speak of
+        if( (fl & 0x0040L) != 0 )       // WOW_SCROLLEND: the burst is over
+            break;
+        if( (fl & 0x2000L) == 0 && (fl & 0x4000L) == 0 )
+            break;                      // no direction the guess knows
+        pmWheelScroll( (fl & 0x2000L) != 0 );
         return 0;
         }
 
@@ -1353,12 +1463,21 @@ static Boolean pmBuildPage( ushort rows, ushort cols )
     /* The DC and a PS built on it with GPIA_ASSOC -- the association flag
        is what lets WinBeginPaint hand the same PS to each paint, which
        eFTE passes to it (g_pm.cpp:2016, 2201). */
-    const HDC hdc = WinOpenWindowDC( gClient );
-    if( hdc == 0 )
+    /* The window's DC, opened once and kept: every rebuild since has
+       opened another and none has been closed (no pair exists in these
+       headers, see pmTeardownPage), which turned a thirty-five-step drag
+       into thirty-five leaks -- the exhaustion that made dialogs stop
+       appearing and the exit stop answering after a resize.  eFTE opens
+       one at birth and lives on it (g_pm.cpp:2014); this does the same,
+       the DC outliving every page and PS built on top of it. */
+    if( gHdc == 0 )
+        gHdc = WinOpenWindowDC( gClient );
+    if( gHdc == 0 )
         {
         pmLogErr( "avio: WinOpenWindowDC" );
         return False;
         }
+    const HDC hdc = gHdc;
     SIZEL sizl;
     sizl.cx = 0;
     sizl.cy = 0;
@@ -1598,19 +1717,10 @@ static void pmCloseWindow()
     gWakeUp = False;
     if( gWakeTid != 0 )
         DosSleep( kIdleWakeMs + 100 );
-    if( gHvps != 0 )
-        {
-        // eFTE's order (g_pm.cpp:2032..2034): come off the DC, destroy
-        // the page, destroy the PS it was shown through.
-        VioAssociate( (HDC) 0, gHvps );
-        VioDestroyPS( gHvps );
-        gHvps = 0;
-        }
-    if( gHpsScreen != 0 )
-        {
-        GpiDestroyPS( gHpsScreen );
-        gHpsScreen = 0;
-        }
+    // eFTE's order (g_pm.cpp:2032..2034): come off the DC, destroy the
+    // page, destroy the PS it was shown through -- and close the window
+    // DC under it, which is what pmTeardownPage has always ended with.
+    pmTeardownPage();
     if( gFrame != 0 )
         {
         WinDestroyWindow( gFrame );
@@ -1859,7 +1969,20 @@ TScreenCell *THardwareInfo::allocateScreenBuffer() noexcept
 {
     // The classic writer indexes the topmost buffer as CHAR_INFO even
     // though the cell type of a legacy build is half the size.
-    return (TScreenCell *) new CHAR_INFO[(size_t) gCols * gRows];
+    //
+    // Zeroed, and that is not a courtesy: the FLAT TDisplay::clearScreen
+    // reaches the hardware only and never touches this array, so whatever
+    // it holds between the allocation and the first draw is what the
+    // whole-screen write of a resize pushes at the shadow.  At birth the
+    // heap hands out fresh pages and the zeros arrive by luck -- zero is
+    // invisible anyway, the blank glyph on black.  A resize's allocation
+    // reclaims the memory the previous grid was drawn into, and the screen
+    // fills with the last session's text and attributes -- which is the
+    // flood of caret-shaped garbage the box reported mid-drag.
+    CHAR_INFO *cells = new CHAR_INFO[(size_t) gCols * gRows];
+    if( cells != 0 )
+        memset( cells, 0, (size_t) gCols * gRows * sizeof( CHAR_INFO ) );
+    return (TScreenCell *) cells;
 }
 
 void THardwareInfo::freeScreenBuffer( TScreenCell *buffer ) noexcept
