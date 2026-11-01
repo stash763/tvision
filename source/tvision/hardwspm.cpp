@@ -256,6 +256,12 @@ enum
        eFTE has one (measured), so this is IBM's later record -- that the
        box really delivers 0x324 is what the log line below will say. */
     kWmMouseWheel   = 0x0324,
+
+    /* (An earlier draft answered 0x0210 as the adjust request; the
+       header tree on hand names it after all -- WM_ADJUSTWINDOWPOS is
+       0x0008, pmwin.h:712 -- and the transcribed number was catching
+       whatever message 0x0210 happens to be.  The real constant is in
+       the code now.) */
     };
 
 //
@@ -265,6 +271,9 @@ enum
 static HAB    gHab      = 0;
 static HMQ    gHmq      = 0;
 static HWND   gFrame    = 0;
+static PFNWP  gOldFrameProc = 0;  // the standard frame's own procedure,
+                                  // kept to chain to from ours (eFTE's
+                                  // oldFrameProc, g_pm.cpp:189, 2304)
 static HWND   gClient   = 0;
 static HPS    gHpsScreen = 0;   // the PS built on the window's DC and
                                 // associated with the page (GPIA_ASSOC);
@@ -363,6 +372,8 @@ static Boolean gFocusOutLogged = False;   // whether the pointer is heard
 static Boolean gMouseLogged = False;      // at all, each logged once
 static Boolean gAdjustLogged = False;     // the snap request: once, to
                                           // vouch for its number
+static Boolean gFrameAdjustLogged = False;    // ... at either window
+static int gUnknownMsgs = 0;              // the capture net: forty at most
 static int gWheelLogs = 0;                // the wheel: its first few raw
                                           // messages, then silence
 
@@ -804,6 +815,14 @@ static void pmResizeTo( ushort rows, ushort cols )
         return;
         }
 
+    /* The caret is PM's inversion painted over the page, and the page is
+       about to change all over: torn down and repainted with the caret
+       shown, it leaves that inversion wherever it blinked -- which is the
+       screenful of carets a drag was reported to fill with.  Away before
+       the teardown, back once at the end; pmUpdateCaret re-shows it. */
+    WinShowCursor( gClient, FALSE );
+    WinDestroyCursor( gClient );
+
     pmTeardownPage();
     if( !pmBuildPage( rows, cols ) )
         {
@@ -812,7 +831,8 @@ static void pmResizeTo( ushort rows, ushort cols )
         // each other, which is the one contract nothing else may break.
         pmLog( "resize: page rebuild failed" );
         gAvioOk = False;
-        return;
+        pmUpdateCaret();    // the caret goes back to the grid that
+        return;             // survives, dark or not
         }
 
     gCols = cols;
@@ -825,6 +845,53 @@ static void pmResizeTo( ushort rows, ushort cols )
     pmUpdateCaret();              // PM's caret, at its cell in the new
                                   // grid -- or destroyed, if the cursor
                                   // fell outside it
+    pmInvalidateWhole();          // and one whole-window repaint: the
+                                  // pass that paints over every pixel
+                                  // the caret's inversion left behind
+}
+
+/* Snap a proposed frame rect so the client becomes exactly cells wide
+   and tall.  The page covers cols x cell by rows x cell and nothing
+   more, so anything between that and the size the drag asked for is not
+   a margin -- it is unpainted window, the debris that dragged
+   window-edge trails across the widened area.  The frame-to-client step
+   is the inverse of the call that sized the window at its birth, and
+   the client-to-frame step is that birth call itself, verbatim, which
+   is what makes the answer land exact.  The arithmetic reads the rect,
+   not the window, so it follows whichever window -- frame or client --
+   is answering. */
+static void pmSnapSWP( HWND hwndFrame, PSWP pswp )
+{
+    if( ( pswp->fl & SWP_SIZE ) == 0 )
+        return;
+
+    RECTL r0;
+    r0.xLeft = 0;
+    r0.yBottom = 0;
+    r0.xRight = pswp->cx;
+    r0.yTop = pswp->cy;
+    WinCalcFrameRect( hwndFrame, &r0, TRUE );
+    LONG cw = r0.xRight - r0.xLeft;
+    LONG ch = r0.yTop - r0.yBottom;
+    ushort cols = (ushort) ( cw / (LONG) gCellPxW );
+    ushort rows = (ushort) ( ch / (LONG) gCellPxH );
+    if( cols < kMinCols )
+        cols = kMinCols;
+    if( rows < kMinRows )
+        rows = kMinRows;
+
+    RECTL r1;
+    r1.xLeft = 0;
+    r1.yBottom = 0;
+    r1.xRight = (LONG) cols * (LONG) gCellPxW;
+    r1.yTop = (LONG) rows * (LONG) gCellPxH;
+    WinCalcFrameRect( hwndFrame, &r1, FALSE );
+    LONG newCx = r1.xRight - r1.xLeft;
+    LONG newCy = r1.yTop - r1.yBottom;
+    pswp->y += pswp->cy - newCy;  // PM's origin is the bottom edge: a
+                                  // window resized keeps its top edge
+    pswp->cx = newCx;
+    pswp->cy = newCy;
 }
 
 static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
@@ -902,66 +969,25 @@ static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
         }
         return 0;
 
-    /* The snap: the page is exactly cols x cell pixels, and anything
-       between that and the size the user dragged is not a margin -- it
-       is unpainted window, the debris that dragged window-edge trails
-       across the widened area.  PM offers this request during a move or
-       size for exactly the answer, and the VIO window class answers it
-       with cell snapping by default; neither header tree on hand has the
-       name (measured -- Watcom's message list stops where OS/2 2.0's
-       did), so 0x0210 is transcribed like the rest of the input
-       vocabulary, and the first arrival logs itself so the box vouches
-       for the number or tells us it never came. */
-    case 0x0210:  // WM_ADJUSTWINDOWPOS
+    /* The adjust request that answers with the cell snap belongs to the
+       frame -- see pmFrameProc.  Some documented PM configurations give
+       the client a turn at it too, so the door stays open here and
+       answers the one way; no log line, because this case has never run
+       on the box and a line is only worth its log when it can answer a
+       question. */
+    case WM_ADJUSTWINDOWPOS:
         {
-            PSWP pswp = (PSWP) PVOIDFROMMP( mp1 );
-            if( !gAdjustLogged && gLog != 0 )
-                {
-                gAdjustLogged = True;
-                fprintf( gLog, "adjust x=%ld y=%ld cx=%ld cy=%ld fl=0x%lx\n",
-                         (long) pswp->x, (long) pswp->y,
-                         (long) pswp->cx, (long) pswp->cy,
-                         (unsigned long) pswp->fl );
-                fflush( gLog );
-                }
-            if( gAvioOk && ( pswp->fl & SWP_SIZE ) != 0 )
-                {
-                /* Frame size in, client size out -- the inverse of the
-                   call at the window's birth, which put the grid's rect
-                   in and took the frame's out. */
-                RECTL r0;
-                r0.xLeft = 0;
-                r0.yBottom = 0;
-                r0.xRight = pswp->cx;
-                r0.yTop = pswp->cy;
-                WinCalcFrameRect( gFrame, &r0, TRUE );
-                LONG cw = r0.xRight - r0.xLeft;
-                LONG ch = r0.yTop - r0.yBottom;
-                ushort cols = (ushort) ( cw / (LONG) gCellPxW );
-                ushort rows = (ushort) ( ch / (LONG) gCellPxH );
-                if( cols < kMinCols )
-                    cols = kMinCols;
-                if( rows < kMinRows )
-                    rows = kMinRows;
-
-                /* Snapped client size in, frame size out -- this half is
-                   the birth call itself, verbatim, which is what makes
-                   the answer exact. */
-                RECTL r1;
-                r1.xLeft = 0;
-                r1.yBottom = 0;
-                r1.xRight = (LONG) cols * (LONG) gCellPxW;
-                r1.yTop = (LONG) rows * (LONG) gCellPxH;
-                WinCalcFrameRect( gFrame, &r1, FALSE );
-                LONG newCx = r1.xRight - r1.xLeft;
-                LONG newCy = r1.yTop - r1.yBottom;
-                pswp->y += pswp->cy - newCy;  // PM's origin is the bottom
-                                              // edge: a window resized
-                                              // keeps its top
-                pswp->cx = newCx;
-                pswp->cy = newCy;
-                }
-            return 0;
+        PSWP pswp = (PSWP) PVOIDFROMMP( mp1 );
+        if( !gAdjustLogged && gLog != 0 )
+            {
+            gAdjustLogged = True;
+            fprintf( gLog, "adjust at client cx=%ld cy=%ld fl=0x%lx\n",
+                     (long) pswp->cx, (long) pswp->cy,
+                     (unsigned long) pswp->fl );
+            fflush( gLog );
+            }
+        pmSnapSWP( gFrame, pswp );
+        return 0;
         }
 
     case WM_SETFOCUS:
@@ -1125,7 +1151,63 @@ static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
     case WM_DESTROY:
         WinPostMsg( HWND_DESKTOP, WM_QUIT, 0, 0 );
         return 0;
+
+    default:
+        /* The capture net, spread after the wheel's first silence: PM
+           sends *something* to the window under a turning wheel -- which
+           number, and whether this window is the one it asks -- is what
+           these forty logged entries will tell, there being no header,
+           toolkit sample or eFTE line on hand that names the wheel's
+           message.  The alarm's posts are the clock, not news. */
+        if( msg != kWmWake && gUnknownMsgs < 40 && gLog != 0 )
+            {
+            ++gUnknownMsgs;
+            fprintf( gLog, "msg 0x%lx\n", (unsigned long) msg );
+            fflush( gLog );
+            }
+        break;
     }
+    return WinDefWindowProc( hwnd, msg, mp1, mp2 );
+}
+
+/* The frame's own procedure, hung on the standard frame by
+   WinSubclassWindow -- eFTE's oldFrameProc ritual (g_pm.cpp:189, 2304,
+   1938), borrowed because WM_ADJUSTWINDOWPOS is a conversation between
+   the window manager and the frame: thirty-five drags arrived at the
+   client as WM_SIZE and the client's adjust case, then still answering
+   to a transcribed-forgetaboutit number, never once.  The snap is
+   answered here; every other message goes to the frame's own procedure
+   exactly as it did before this file existed.  The wheel gets a look in
+   too -- whether PM speaks it to the frame instead of the client is one
+   of the questions this session was built to ask. */
+static MRESULT EXPENTRY pmFrameProc( HWND hwnd, ULONG msg,
+                                     MPARAM mp1, MPARAM mp2 )
+{
+    if( msg == WM_ADJUSTWINDOWPOS )
+        {
+        PSWP pswp = (PSWP) PVOIDFROMMP( mp1 );
+        if( !gFrameAdjustLogged && gLog != 0 )
+            {
+            gFrameAdjustLogged = True;
+            fprintf( gLog, "adjust at frame cx=%ld cy=%ld fl=0x%lx\n",
+                     (long) pswp->cx, (long) pswp->cy,
+                     (unsigned long) pswp->fl );
+            fflush( gLog );
+            }
+        pmSnapSWP( hwnd, pswp );
+        }
+    else if( msg == kWmMouseWheel && gWheelLogs < 8 && gLog != 0 )
+        {
+        ++gWheelLogs;
+        fprintf( gLog, "wheel at frame a=%d b=%d c=%d d=%d\n",
+                 (int) (short) SHORT1FROMMP( mp1 ),
+                 (int) (short) SHORT2FROMMP( mp1 ),
+                 (int) (short) SHORT2FROMMP( mp2 ),
+                 (int) (short) SHORT1FROMMP( mp2 ) );
+        fflush( gLog );
+        }
+    if( gOldFrameProc != 0 )
+        return gOldFrameProc( hwnd, msg, mp1, mp2 );
     return WinDefWindowProc( hwnd, msg, mp1, mp2 );
 }
 
@@ -1420,6 +1502,15 @@ static void pmOpenWindow()
         return;
         }
     pmLog( "window ok" );
+
+    /* The frame is the window manager's partner for position matters,
+       and that is where the snap belongs -- subclass it the way eFTE
+       subclasses what it cannot replace (the saved procedure is the
+       chain; if saving ever failed, the messages keep flowing to the
+       frame by way of pmFrameProc's own guard below). */
+    gOldFrameProc = WinSubclassWindow( gFrame, pmFrameProc );
+    if( gOldFrameProc == 0 )
+        pmLogErr( "frame subclass" );
 
     // The window makes the native dialogs possible: hand them to the
     // application now (src/tui/pmdialogs.h), before the first paint and
