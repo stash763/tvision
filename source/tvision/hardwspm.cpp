@@ -72,10 +72,11 @@
  *
  * Known v1 limits, each one a decision and not an oversight:
  *
- *   - 80x25 fixed.  The window resizes; the grid does not follow it yet.
- *     VIO could not resize either and the application copes; making the
- *     grid follow needs setScreenMode to drive a tvision resize, and that
- *     is its own step.
+ *   - the grid follows the window by rebuilding the page, one cell at a
+ *     time: a size is a whole new page, so resizing redraws the screen
+ *     rather than stretching it.  The drag snaps to cells (the adjust
+ *     request), which is the text-mode feel and keeps the page covering
+ *     the client exactly.
  *   - closing the window asks the application to quit the way Alt-X does
  *     -- an injected key, the only exit key this application answers --
  *     and after five seconds of not having exited, it stops asking.
@@ -121,6 +122,9 @@
 #define Uses_TEvent
 #define Uses_TScreen        // TDisplay, whose video mode constants getScreenMode answers with
 #define Uses_THardwareInfo
+#define Uses_TProgram       // tv.h takes this as the word to open app.h,
+                            // and app.h is where resizeScreen -- the other
+                            // half of every size change -- lives
 #include <tvision/tv.h>
 
 #include <string.h>
@@ -154,6 +158,10 @@ enum
     kCellWMax   = 32,
     kCellHMin   = 6,
     kCellHMax   = 32,
+
+    kMinCols    = 20,       // the smallest grid worth painting: below it
+    kMinRows    = 6,        // the status line and the prompt start eating
+                            // each other, and the frame stops there too
 
     /* WinPeekMsg's only flag, eFTE's spelling (PM_NOREMOVE): the driver
        asks "anything in the queue" and lets WinGetMsg do the taking.  The
@@ -267,6 +275,10 @@ static HVPS   gHvps      = 0;   // the AVIO page: a BIOS text screen that
 static Boolean gAvioOk   = False;
 static Boolean gPmUp    = False; // window + queue exist; drawing is legal
 static Boolean gClosed  = False; // the user closed the window
+static int gDialogs     = 0;     // native PM dialogs in flight, per pmdlg
+static Boolean gPendResize = False;  // a resize asked for while one was up
+static ushort gPendCols  = 0;
+static ushort gPendRows  = 0;
 static Boolean gQuitKeySent = False;
 static uint64_t gClosedMs = 0;
 static ulong  gClientW  = 0;    // client area in pixels, kept from WM_SIZE
@@ -349,6 +361,8 @@ static Boolean gKeyLogged = False;
 static Boolean gFocusInLogged = False;    // which window answers focus, and
 static Boolean gFocusOutLogged = False;   // whether the pointer is heard
 static Boolean gMouseLogged = False;      // at all, each logged once
+static Boolean gAdjustLogged = False;     // the snap request: once, to
+                                          // vouch for its number
 static int gWheelLogs = 0;                // the wheel: its first few raw
                                           // messages, then silence
 
@@ -667,6 +681,18 @@ HWND pmFrameWindow( void )
     return gFrame;
 }
 
+/* pmdlg says here when a modal dialog opens and closes.  While one is up
+   the application beneath is not drawing -- its whole loop sits behind
+   WinDlgBox's own -- and rebuilding the screen under an open dialog is
+   not something to try on a machine someone is watching.  So resizes
+   that arrive mid-dialog wait for the count to fall back to zero. */
+void pmNoteDialog( int delta )
+{
+    gDialogs += delta;
+    if( gDialogs < 0 )
+        gDialogs = 0;
+}
+
 static void pmTakeCommand( int id )
 {
     struct CommandKey
@@ -735,6 +761,72 @@ static void pmUpdateCaret()
     WinShowCursor( gClient, TRUE );
 }
 
+//
+// The resize.  A page is fixed at its birth -- rows and cols are in the
+// VioCreatePS and that is the size of the memory it owns -- so following
+// the window means tearing the trio down and building it again at the new
+// size, exactly what pmInitAvio did at birth and for the same reasons in
+// the same order.  Nothing knows a new size until every step has
+// succeeded: a half-resized screen, half of it somebody else's memory, is
+// the one way this file could corrupt the box.
+//
+
+static Boolean pmBuildPage( ushort rows, ushort cols );
+
+static void pmTeardownPage()
+{
+    if( gHvps != 0 )
+        {
+        VioAssociate( (HDC) 0, gHvps );   // the pair close.c does at the
+        VioDestroyPS( gHvps );            // end of all things, done here
+        gHvps = 0;                        // at the end of every size
+        }
+    if( gHpsScreen != 0 )
+        {
+        GpiDestroyPS( gHpsScreen );
+        gHpsScreen = 0;
+        }
+}
+
+static void pmResizeTo( ushort rows, ushort cols )
+{
+    if( gLog != 0 )
+        fprintf( gLog, "resize %ux%u -> %ux%u\n",
+                 gCols, gRows, cols, rows ), fflush( gLog );
+
+    if( gDialogs > 0 )
+        {
+        // A native dialog owns the screen right now; waitForEvents picks
+        // the news up when the count falls back to zero.
+        gPendResize = True;
+        gPendCols = cols;
+        gPendRows = rows;
+        return;
+        }
+
+    pmTeardownPage();
+    if( !pmBuildPage( rows, cols ) )
+        {
+        // The window keeps the old grid and goes dark rather than half:
+        // the shadow, the tvision buffer and the page still agree with
+        // each other, which is the one contract nothing else may break.
+        pmLog( "resize: page rebuild failed" );
+        gAvioOk = False;
+        return;
+        }
+
+    gCols = cols;
+    gRows = rows;
+    ensureShadow();               // reallocated and forgotten: the new
+                                  // page is blank, and the shadow must
+                                  // believe that until told otherwise
+    if( TProgram::application != 0 )
+        TProgram::application->resizeScreen( gCols, gRows );
+    pmUpdateCaret();              // PM's caret, at its cell in the new
+                                  // grid -- or destroyed, if the cursor
+                                  // fell outside it
+}
+
 static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
 {
     switch( msg )
@@ -783,16 +875,94 @@ static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
     case WM_SIZE:
         // The page engine hears of the new client first -- eFTE forwards
         // WM_SIZE to WinDefAVioWindowProc (g_pm.cpp:2065) to keep the
-        // associated viewport honest.  The grid is fixed, so all this
-        // file keeps afterwards is the pixel size the mouse maps against.
+        // associated viewport honest.  Then the grid follows the window,
+        // at whatever size actually fits and never below the floor; the
+        // adjust request below keeps the client to the grid, so this
+        // arithmetic lands on cell boundaries and the page covers the
+        // client exactly.  The first WM_SIZE is the window's birth,
+        // before the page exists -- and a page is not built twice.
         WinDefAVioWindowProc( hwnd, msg, (ULONG) mp1, (ULONG) mp2 );
         {
             RECTL rect;
             WinQueryWindowRect( hwnd, &rect );
             gClientW = (ulong) ( rect.xRight - rect.xLeft );
             gClientH = (ulong) ( rect.yTop - rect.yBottom );
+
+            if( gAvioOk )
+                {
+                ushort cols = (ushort) ( gClientW / gCellPxW );
+                ushort rows = (ushort) ( gClientH / gCellPxH );
+                if( cols < kMinCols )
+                    cols = kMinCols;
+                if( rows < kMinRows )
+                    rows = kMinRows;
+                if( cols != gCols || rows != gRows )
+                    pmResizeTo( rows, cols );
+                }
         }
         return 0;
+
+    /* The snap: the page is exactly cols x cell pixels, and anything
+       between that and the size the user dragged is not a margin -- it
+       is unpainted window, the debris that dragged window-edge trails
+       across the widened area.  PM offers this request during a move or
+       size for exactly the answer, and the VIO window class answers it
+       with cell snapping by default; neither header tree on hand has the
+       name (measured -- Watcom's message list stops where OS/2 2.0's
+       did), so 0x0210 is transcribed like the rest of the input
+       vocabulary, and the first arrival logs itself so the box vouches
+       for the number or tells us it never came. */
+    case 0x0210:  // WM_ADJUSTWINDOWPOS
+        {
+            PSWP pswp = (PSWP) PVOIDFROMMP( mp1 );
+            if( !gAdjustLogged && gLog != 0 )
+                {
+                gAdjustLogged = True;
+                fprintf( gLog, "adjust x=%ld y=%ld cx=%ld cy=%ld fl=0x%lx\n",
+                         (long) pswp->x, (long) pswp->y,
+                         (long) pswp->cx, (long) pswp->cy,
+                         (unsigned long) pswp->fl );
+                fflush( gLog );
+                }
+            if( gAvioOk && ( pswp->fl & SWP_SIZE ) != 0 )
+                {
+                /* Frame size in, client size out -- the inverse of the
+                   call at the window's birth, which put the grid's rect
+                   in and took the frame's out. */
+                RECTL r0;
+                r0.xLeft = 0;
+                r0.yBottom = 0;
+                r0.xRight = pswp->cx;
+                r0.yTop = pswp->cy;
+                WinCalcFrameRect( gFrame, &r0, TRUE );
+                LONG cw = r0.xRight - r0.xLeft;
+                LONG ch = r0.yTop - r0.yBottom;
+                ushort cols = (ushort) ( cw / (LONG) gCellPxW );
+                ushort rows = (ushort) ( ch / (LONG) gCellPxH );
+                if( cols < kMinCols )
+                    cols = kMinCols;
+                if( rows < kMinRows )
+                    rows = kMinRows;
+
+                /* Snapped client size in, frame size out -- this half is
+                   the birth call itself, verbatim, which is what makes
+                   the answer exact. */
+                RECTL r1;
+                r1.xLeft = 0;
+                r1.yBottom = 0;
+                r1.xRight = (LONG) cols * (LONG) gCellPxW;
+                r1.yTop = (LONG) rows * (LONG) gCellPxH;
+                WinCalcFrameRect( gFrame, &r1, FALSE );
+                LONG newCx = r1.xRight - r1.xLeft;
+                LONG newCy = r1.yTop - r1.yBottom;
+                pswp->y += pswp->cy - newCy;  // PM's origin is the bottom
+                                              // edge: a window resized
+                                              // keeps its top
+                pswp->cx = newCx;
+                pswp->cy = newCy;
+                }
+            return 0;
+        }
 
     case WM_SETFOCUS:
         gFocused = True;
@@ -1092,7 +1262,11 @@ static void pmWakeLoop( void * )
    by hand to get the same job (builds two through seven: the font recipe,
    the palette table, the fill-and-ink paint) is gone, and each of its
    measured failures with it. */
-static Boolean pmInitAvio()
+/* Build the trio -- the DC, the GPI PS on it, and the AVIO page -- for a
+   grid of rows and cols.  At birth this is the grid the application asked
+   for; afterwards it is whatever pmResizeTo read off the window, which is
+   why the size comes in as arguments and not out of the globals. */
+static Boolean pmBuildPage( ushort rows, ushort cols )
 {
     /* The DC and a PS built on it with GPIA_ASSOC -- the association flag
        is what lets WinBeginPaint hand the same PS to each paint, which
@@ -1119,7 +1293,7 @@ static Boolean pmInitAvio()
        eFTE's exact arguments (g_pm.cpp:2018), its page merely sized to
        its own maximum where this one is sized to the grid the application
        was started with. */
-    const USHORT rcPs = VioCreatePS( &gHvps, (SHORT) gRows, (SHORT) gCols,
+    const USHORT rcPs = VioCreatePS( &gHvps, (SHORT) rows, (SHORT) cols,
                                      0, 1, 0 );
     if( gLog != 0 )
         fprintf( gLog, "avio ps rc=%u hvps=%u\n",
@@ -1177,6 +1351,11 @@ static Boolean pmInitAvio()
 
     gAvioOk = True;
     return True;
+}
+
+static Boolean pmInitAvio()
+{
+    return pmBuildPage( gRows, gCols );
 }
 
 static void pmOpenWindow()
@@ -1685,6 +1864,14 @@ void THardwareInfo::waitForEvents( int timeoutMs ) noexcept
         fflush( gLog );
         }
     flushScreen();
+
+    /* A resize asked for while a native dialog was up: the dialog is
+       gone now, and the screen belongs to the application again. */
+    if( gPendResize && gDialogs == 0 )
+        {
+        gPendResize = False;
+        pmResizeTo( gPendRows, gPendCols );
+        }
 
     /* The closed window asks the application to end, once; five seconds
        later the asking stops and the process does.  The flag is earned by

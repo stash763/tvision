@@ -16,6 +16,7 @@
 #define Uses_TProgram
 #define Uses_TEvent
 #define Uses_TScreen
+#define Uses_THardwareInfo
 #define Uses_TStatusLine
 #define Uses_TMenu
 #define Uses_TGroup
@@ -326,6 +327,46 @@ void TProgram::setScreenMode( ushort mode )
     changeBounds( r );
     setState(sfExposed, False);
     setState(sfExposed, True);
+    redraw();
+    TMouse::show();
+}
+
+void TProgram::resizeScreen( ushort w, ushort h )
+{
+// The same refresh setScreenMode makes when the mode changes, aimed at a
+// screen that changed size instead: a new buffer, new extents for the
+// chrome, and everything redrawn.  It is a member for the same reason
+// setScreenMode is -- buffer is the group's own -- and it is called by
+// the one backend that can grow a screen (the PM driver, from WM_SIZE)
+// after that backend has retold its own grid, because the buffer this
+// allocates is sized from the hardware layer's numbers and not from
+// these fields.  The application's own views follow on the next timer
+// tick: the desktop they are laid out against carries its new size from
+// here.
+    if( w == 0 || h == 0 )
+        return;
+    if( w == TScreen::screenWidth && h == TScreen::screenHeight )
+        return;
+
+    TMouse::hide();
+    THardwareInfo::freeScreenBuffer( TScreen::screenBuffer );
+    TScreen::screenBuffer = THardwareInfo::allocateScreenBuffer();
+    TScreen::screenWidth = w;
+    TScreen::screenHeight = h;
+    TScreen::hiResScreen = Boolean( h > 25 );
+    TScreen::clearScreen();
+    buffer = TScreen::screenBuffer;
+
+    TRect r( 0, 0, w, h );
+    changeBounds( r );
+    if( menuBar )
+        menuBar->changeBounds( TRect( 0, 0, w, 1 ) );
+    if( deskTop )
+        deskTop->changeBounds( r );
+    if( statusLine )
+        statusLine->changeBounds( TRect( 0, h-1, w, h ) );
+    setState( sfExposed, False );
+    setState( sfExposed, True );
     redraw();
     TMouse::show();
 }

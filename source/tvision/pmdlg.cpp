@@ -60,6 +60,9 @@
    sit above it and the frame disables behind them (the modal loop's doing,
    not ours). */
 extern HWND pmFrameWindow( void );
+extern void pmNoteDialog( int delta );    // hardwspm.cpp: the driver
+                                          // defers resizes while the
+                                          // count is up
 
 /* LM_QUERYSELECTION's "nothing selected" answer is the -1 MPARAM that later
    SDKs spell MP_DELNEG; neither header set this build reads carries the
@@ -118,8 +121,13 @@ MRESULT EXPENTRY pmThemeDlgProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
 static int pmThemeDialog( void )
 {
     // WinDismissDlg's TRUE is what WinDlgBox hands back; DID_OK is 1.
-    return WinDlgBox( HWND_DESKTOP, pmFrameWindow(), pmThemeDlgProc,
-                      0, kDlgTheme, NULL ) == DID_OK;
+    // pmNoteDialog (hardwspm.cpp) counts the modal loops: the driver
+    // defers any resize that arrives while one is running.
+    pmNoteDialog( +1 );
+    const int shown = WinDlgBox( HWND_DESKTOP, pmFrameWindow(), pmThemeDlgProc,
+                                 0, kDlgTheme, NULL ) == DID_OK;
+    pmNoteDialog( -1 );
+    return shown;
 }
 
 /* ------------------------------------------------------------ about ------- */
@@ -129,8 +137,10 @@ static int pmAboutDialog( void )
     // eFTE's simplest dialog (g_pm.cpp:878): a message box is a dialog, and
     // an About box is a message.  MB_INFORMATION buys the icon and the
     // system beep the toolkit prescribes.
+    pmNoteDialog( +1 );
     WinMessageBox( HWND_DESKTOP, pmFrameWindow(), pmAboutText(),
                    "atui - About", 0, MB_INFORMATION | MB_OK );
+    pmNoteDialog( -1 );
     return 1;
 }
 
@@ -192,8 +202,11 @@ static int pmSwitchModelDialog( void )
 {
     if( pmModelCount() == 0 )
         return 0;
-    return WinDlgBox( HWND_DESKTOP, pmFrameWindow(), pmSwitchModelDlgProc,
-                      0, kDlgSwitchModel, NULL ) == DID_OK;
+    pmNoteDialog( +1 );
+    const int shown = WinDlgBox( HWND_DESKTOP, pmFrameWindow(), pmSwitchModelDlgProc,
+                                 0, kDlgSwitchModel, NULL ) == DID_OK;
+    pmNoteDialog( -1 );
+    return shown;
 }
 
 /* --------------------------------------------------------------- the kit -- */

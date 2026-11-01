@@ -275,6 +275,7 @@ public:
     virtual void run();
     virtual TWindow* insertWindow(TWindow*);
     void setScreenMode( ushort mode );
+    void resizeScreen( ushort w, ushort h );
     TView *validView( TView *p ) noexcept;
     virtual void shutDown();
 
