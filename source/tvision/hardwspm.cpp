@@ -79,8 +79,13 @@
  *   - closing the window asks the application to quit the way Alt-X does
  *     -- an injected key, the only exit key this application answers --
  *     and after five seconds of not having exited, it stops asking.
+ *     The deadline is kept by the alarm thread as well as the wait, so
+ *     it holds even when the stall is in the leaving itself.
+ *   - the wheel answers as far as the box has been taught: PM's wheel
+ *     message postdates every header and reference on hand, its number
+ *     is a record and its shape a guess until the log says otherwise.
  *   - no clipboard (the PM one is reachable from here, unlike the VIO
- *     driver's excuse, and wiring it is still undone), no wheel.
+ *     driver's excuse, and wiring it is still undone).
  *   - the caret is PM's own -- WinCreateCursor, created on focus and
  *     recreated to move, the eFTE pattern (g_pm.cpp:2105..2130) -- and
  *     PM's caret speaks one shape, a flashing solid block; tvision's
@@ -237,6 +242,12 @@ enum
     kWmButton2Up    = 0x0075,
     kWmButton3Down  = 0x0077,
     kWmButton3Up    = 0x0078,
+
+    /* The wheel arrived in PM after Watcom's headers were written: neither
+       header tree on hand carries the name, and neither the toolkit nor
+       eFTE has one (measured), so this is IBM's later record -- that the
+       box really delivers 0x324 is what the log line below will say. */
+    kWmMouseWheel   = 0x0324,
     };
 
 //
@@ -338,6 +349,8 @@ static Boolean gKeyLogged = False;
 static Boolean gFocusInLogged = False;    // which window answers focus, and
 static Boolean gFocusOutLogged = False;   // whether the pointer is heard
 static Boolean gMouseLogged = False;      // at all, each logged once
+static int gWheelLogs = 0;                // the wheel: its first few raw
+                                          // messages, then silence
 
 static void pmLog( const char *what )
 {
@@ -859,6 +872,57 @@ static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
         }
         return 0;
 
+    case kWmMouseWheel:
+        {
+        /* Log first, trust second: the message number is IBM's record and
+           the box has never been asked, and no reference says which half of
+           which parameter carries the notch count.  The guess below -- the
+           signed delta is mp2's low short, the sign the direction -- is the
+           shape every later PM program documents; the first eight rolls of
+           the wheel print both parameters raw, and the box's answer is the
+           measurement that settles it. */
+        const short delta = (short) SHORT1FROMMP( mp2 );
+        if( gWheelLogs < 8 && gLog != 0 )
+            {
+            ++gWheelLogs;
+            fprintf( gLog, "wheel a=%d b=%d c=%d d=%d\n",
+                     (int) (short) SHORT1FROMMP( mp1 ),
+                     (int) (short) SHORT2FROMMP( mp1 ),
+                     (int) (short) SHORT2FROMMP( mp2 ),
+                     (int) delta );
+            fflush( gLog );
+            }
+
+        /* The position scrolls what the pointer is over, and the guess
+           about shape has to say where the position lives too: mp1 is
+           taken as the point and mp2's low short as the delta, one
+           consistent reading of a message nobody here has measured.  If
+           the box's numbers come out shuffled -- a delta of thousands, a
+           position of 120 -- the log above names the truth and the two
+           swap places. */
+        MouseEventType mouse;
+        POINTL pt;
+        pt.x = (LONG) (short) SHORT1FROMMP( mp1 );
+        pt.y = (LONG) (short) SHORT2FROMMP( mp1 );
+        fillMouse( mouse,
+                   (int) (pt.x / (long) gCellPxW),
+                   (int) ( ((long) gClientH - 1 - pt.y) / (long) gCellPxH ),
+                   gMouseButtons,
+                   0,            // a wheel is an event, not a motion
+                   delta >= 0 ? mwUp : mwDown,
+                   (SHORT1FROMMP( mp2 ) & kKcCtrl) ? kbCtrlShift : 0 );
+        if( mouse.where.x < 0 )
+            mouse.where.x = 0;
+        if( mouse.where.y < 0 )
+            mouse.where.y = 0;
+        if( mouse.where.x >= (int) gCols )
+            mouse.where.x = (int) gCols - 1;
+        if( mouse.where.y >= (int) gRows )
+            mouse.where.y = (int) gRows - 1;
+        putMouse( mouse );
+        return 0;
+        }
+
     // No WM_CAPTURECHANGED safety net here, though PM does offer the
     // capture-changed notice: the message and its constant are not in
     // Watcom's headers (measured), and the capture mechanism itself is what
@@ -880,8 +944,11 @@ static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
         // the one exit this application answers from inside the UI.  If it
         // has not gone by kQuitForceMs, it is not going: a window whose
         // application stopped answering is not a window, it is debris.
-        gClosed = True;
+        // The stamp before the flag: the alarm thread keeps the same
+        // deadline now, and it must never see a closed window whose
+        // deadline has not been set yet.
         gClosedMs = THardwareInfo::getTickCountMs();
+        gClosed = True;
         pmLog( "close -> quit" );
         return 0;
 
@@ -912,9 +979,9 @@ static Boolean deliverMessage( QMSG &q )
 {
     if( q.msg == WM_QUIT )
         {
-        gClosed = True;
         if( gClosedMs == 0 )
             gClosedMs = THardwareInfo::getTickCountMs();
+        gClosed = True;
         return False;
         }
     if( q.msg == kWmWake )
@@ -990,6 +1057,19 @@ static void pmWakeLoop( void * )
     while( gWakeUp )
         {
         DosSleep( gWakeMs );
+        /* The force-exit deadline keeps time here too, and not only in
+           the wait below: the report that needed it was a close where the
+           process stalled somewhere else -- leaving means many places --
+           and a deadline only the stalled code can enforce is no deadline.
+           The wait's own check stays; whoever sees it first wins, and the
+           DosExit it reaches is the same one. */
+        if( gClosed && gClosedMs != 0
+            && THardwareInfo::getTickCountMs() - gClosedMs
+                   >= (uint64_t) kQuitForceMs )
+            {
+            pmLog( "force exit" );
+            DosExit( EXIT_PROCESS, 0 );
+            }
         if( gWakeUp && gClient != 0 )
             WinPostMsg( gClient, kWmWake, 0, 0 );
         }
@@ -1607,18 +1687,23 @@ void THardwareInfo::waitForEvents( int timeoutMs ) noexcept
     flushScreen();
 
     /* The closed window asks the application to end, once; five seconds
-       later the asking stops and the process does. */
+       later the asking stops and the process does.  The flag is earned by
+       the delivery, not by the attempt: an earlier shape burned it on a
+       busy slot, which lost the Alt-X altogether and left the closing to
+       the force timer -- and if the application was parked anywhere other
+       than this wait, the timer never ran and nothing was left. */
     if( gClosed && !gQuitKeySent )
         {
-        gQuitKeySent = True;
         if( !gKeyPending )
             {
+            gQuitKeySent = True;
             // The Alt-X of tkeys.h: keyCode 0x2d00 is the key's own scan
             // (0x2d) over character zero with Alt held -- exactly what the
             // VIO driver delivers for Alt and a letter, and so what this
             // application's hotkey table already answers.
             fillKey( gPendingKey, 0, 0x2D, kbAltShift );
             gKeyPending = True;
+            pmLog( "quit key sent" );
             }
         }
     if( gClosed
