@@ -396,8 +396,12 @@ static int gKeyLogs = 0;                // the first thirty keys delivered:
                                         // the story of PgUp is written here
                                         // -- char, virt, scan and flags --
                                         // and a one-line cap told nothing
-static Boolean gFocusInLogged = False;    // which window answers focus, and
-static Boolean gFocusOutLogged = False;   // whether the pointer is heard
+static int gFocusIn = 0;                  // focus arrivals and departures,
+static int gFocusOut = 0;                 // counted a dozen times each: a
+                                          // resize-session prompt that died
+                                          // of stolen focus is written here,
+                                          // and the once-only log could not
+                                          // tell theft from gossip
 static Boolean gMouseLogged = False;      // at all, each logged once
 static Boolean gAdjustLogged = False;     // the snap request: once, to
                                           // vouch for its number
@@ -782,7 +786,21 @@ static Boolean pmVirtualKey( ushort virt, uchar &ch, uchar &scan,
 static void pmTakeChar( ULONG flags, short ch, ushort virt, uchar scan )
 {
     if( gKeyPending )
+        {
+        /* The silent doorstep: if the application ever stops taking the
+           one pending key, every keystroke after it dies here, and the
+           session looks like a dead keyboard with a living pump.  A
+           dozen of these in the log next to a dead prompt will say so. */
+        static int gKeyDrops = 0;
+        if( gKeyDrops < 12 && gLog != 0 )
+            {
+            ++gKeyDrops;
+            fprintf( gLog, "key drop: slot busy ch=0x%02X virt=0x%04X\n",
+                     (unsigned) ch, (unsigned) virt );
+            fflush( gLog );
+            }
         return;     // the application has one key unclaimed; it will ask again
+        }
 
     ushort modifiers = 0;
     if( flags & kKcShift )
@@ -823,7 +841,7 @@ static void pmTakeChar( ULONG flags, short ch, ushort virt, uchar scan )
     fillKey( event, chB, scanB, modifiers );
     if( event.keyDown.keyCode == kbNoKey )
         return;     // a pair no name resolves -- drop it, do not deliver it
-    if( gKeyLogs < 30 )
+    if( gKeyLogs < 60 )
         {
         ++gKeyLogs;         // the probe once needed one line; telling
         if( gLog != 0 )     // PgUp from nothing needs the stream
@@ -1094,6 +1112,25 @@ static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
                                             * (unsigned long) gRows ),
                             (HVIO) gHvps );
                 }
+            /* The scrollbar's column is outside the page -- the grid is
+               cols cells and the bar sits past them -- and nothing ever
+               painted it: WM_ERASEBACKGROUND says no to the whole client,
+               so that column showed raw video memory.  The bar's dither
+               paints only part of it, and the rest of the hatch let the
+               garbage through: the red stripe and the corner blob the
+               box's screenshots showed.  System background gray, filled
+               after the page and under the bar, is the whole of it. */
+            if( gSbW > 0 && gClientW > (ulong) gCols * gCellPxW )
+                {
+                RECTL strip;
+                strip.xLeft = (LONG) gCols * (LONG) gCellPxW;
+                strip.yBottom = 0;
+                strip.xRight = (LONG) gClientW;
+                strip.yTop = (LONG) gClientH;
+                WinFillRect( hps, &strip, 1 /* COLOR_BACKGROUND: IBM's
+                                              system-color index, named
+                                              in no header on hand */ );
+                }
             WinEndPaint( hps );
             struct timeb t1;
             ftime( &t1 );
@@ -1177,12 +1214,12 @@ static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
 
     case WM_SETFOCUS:
         gFocused = True;
-        if( !gFocusInLogged )
+        if( gFocusIn < 12 && gLog != 0 )
             {
-            gFocusInLogged = True;
-            pmLog( "focus in" );   // keys can only arrive after this line;
-                                   // their absence without it is explained
-            }
+            ++gFocusIn;
+            fprintf( gLog, "focus in #%d hwnd=%p\n", gFocusIn, hwnd );
+            fflush( gLog );    // keys can only arrive after an arrival;
+            }                  // whose hwnd took it is the rest of the story
         pmUpdateCaret();
         return WinDefWindowProc( hwnd, msg, mp1, mp2 );
 
@@ -1190,11 +1227,12 @@ static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
         gFocused = False;
         WinDestroyCursor( gClient );  // PM's caret lives only while the
                                       // focus does
-        if( !gFocusOutLogged )
+        if( gFocusOut < 12 && gLog != 0 )
             {
-            gFocusOutLogged = True;
-            pmLog( "focus out" );   // once: the fact is the news, every
-            }                       // theft after it is gossip
+            ++gFocusOut;
+            fprintf( gLog, "focus out #%d hwnd=%p\n", gFocusOut, hwnd );
+            fflush( gLog );
+            }
         return WinDefWindowProc( hwnd, msg, mp1, mp2 );
 
     case WM_CHAR:
@@ -1347,7 +1385,7 @@ static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
         {
         const short code = (short) SHORT2FROMMP( mp2 );
         const short pos  = (short) SHORT1FROMMP( mp2 );
-        if( gVsbLogs < 12 && gLog != 0 )
+        if( gVsbLogs < 24 && gLog != 0 )
             {
             ++gVsbLogs;
             fprintf( gLog, "vsb code=%d pos=%d\n", (int) code, (int) pos );
