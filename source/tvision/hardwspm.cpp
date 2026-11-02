@@ -318,6 +318,34 @@ static LONG   gStatusH      = 0;
 static int    gKeysOnPage   = 0;   // the kit's keysToPage counter
 static Boolean gEntryFocusLogged = False;
 
+/* The prompt is a WC_MLE: the single line of a WC_ENTRYFIELD fits neither
+   of the two things asked of it -- word wrap, and a box that grows as the
+   message gains lines (measured against the entry field: it also carried
+   PM's default 32-character ceiling).  Everything MLE here speaks comes
+   from Watcom's own headers (MLM_*, MLS_*, MLN_*, WC_MLE all present) and
+   from the toolkit's controls sample (create/import/export patterns,
+   sty_dlg.c:1705, sty_file.c:475).  The MLEOVERFLOW shape is the toolkit
+   pmmle.h's, copied because Watcom ships no header for it.
+     gEntryH1     one line's worth of strip, the birth formula's value;
+     gMleLineH    px per extra wrapped line, measured from the control's
+                  own font (GpiQueryFontMetrics on WinGetPS -- the window
+                  DC carries the window's font), lMaxBaselineExt;
+     gEntryLines  the wrapped-line count the growth logic last believed.
+   Text ceiling: PM's entry-field default is 32; the MLE is memory-bound,
+   so the limit is one we state: kEntryMaxChars via MLM_SETTEXTLIMIT. */
+static LONG   gEntryH1      = 0;
+static LONG   gMleLineH     = 0;
+static LONG   gEntryLines   = 1;
+static const LONG kEntryMaxChars = 4096;
+
+typedef struct _ATUIMLEOVER    /* the toolkit's MLEOVERFLOW (pmmle.h) */
+    {
+    ULONG afErrInd;
+    LONG  nBytesOver;
+    LONG  pixHorzOver;
+    LONG  pixVertOver;
+    } ATUIMLEOVER;
+
 /* The transcript is app knowledge; the bar is the driver's.  app.cpp
    (src/tui) implements the first two -- extent of the line list, and a
    jump when the thumb moves -- and calls the driver's pmSyncScrollBar
@@ -1130,20 +1158,153 @@ static void pmSnapSWP( HWND hwndFrame, PSWP pswp )
     pswp->cy = newCy;
 }
 
-/* The entry field's own procedure -- the driver answers for the few keys
-   the control cannot know the meaning of, and lets the entry field be an
-   entry field for every one it does: the arrows, Home/End, selection, the
-   clipboard, all PM's, none of this driver's business.
+/* The prompt's own procedure -- the driver answers for the few keys the
+   control cannot know the meaning of, and lets the MLE be an editor for
+   every one it does: the arrows, Home/End, selection, the clipboard, its
+   own Ctrl-Z undo -- all PM's, none of this driver's business.
 
-   Enter submits: the text is read, the field is cleared (the submit is
-   in flight the moment the Enter goes down, and a re-typed prompt should
-   not double-send what is already on its way), and pmPromptSubmit takes
-   it on the pump's own thread -- the same context the tvision prompt's
-   Enter always had.  PgUp/PgDn belong to the transcript, found by scan
-   code (0x49/0x51), the same identifiers that made the injected pages
-   land.  Ctrl-T toggles the thinking blocks.  Alt chords are the one
-   family deliberately absent: the menu owns them, and WinGetMsg answers
-   for the frame before the field ever sees the character. */
+   Enter submits and stops there: the MLE would insert a newline, the
+   message is one logical line.  The read is the toolkit's proven export
+   pattern, the reset re-makes the control (see pmEntryReset).  PgUp/
+   PgDn belong to the transcript, found by scan code (0x49/0x51), the
+   same identifiers that made the injected pages land.  Ctrl-T toggles
+   the thinking blocks.  Alt chords are forwarded to the application:
+   they are the only keyboard path the status line's promises (Alt-H,
+   Alt-X) ever had, and a control must not swallow a promise. */
+static MRESULT EXPENTRY pmEntryProc( HWND hwnd, ULONG msg,
+                                     MPARAM mp1, MPARAM mp2 );
+
+/* Make the prompt.  One function because two moments need it: birth, and
+   every submit (see pmEntryReset).  Everything it says to the MLE is
+   Watcom-declared and toolkit-patterned; the text limit's return value
+   -- how many characters actually fit -- goes to the log, so if the
+   control ever refuses the arrangement the box says so on the first
+   line the user reads. */
+static HWND pmCreateEntry( void )
+{
+    const HWND h = WinCreateWindow( gGroup, WC_MLE, "",
+                                    WS_VISIBLE | WS_TABSTOP | MLS_WORDWRAP
+                                      | MLS_BORDER,
+                                    0, 0, 0, 0, gGroup, HWND_TOP,
+                                    0, NULL, NULL );
+    if( h == 0 )
+        return 0;
+    gOldEntryProc = WinSubclassWindow( h, pmEntryProc );
+    if( gOldEntryProc == 0 )
+        pmLogErr( "entry subclass" );
+    const LONG fit = (LONG) WinSendMsg( h, MLM_SETTEXTLIMIT,
+                                        MPFROMLONG( kEntryMaxChars ),
+                                        MPVOID );
+    if( gLog != 0 )
+        fprintf( gLog, "entry limit %ld fit %ld\n", kEntryMaxChars, fit ),
+            fflush( gLog );
+    /* Pixels per wrapped line, measured not guessed: a PM window's own
+       GPI presentation space carries that window's font, so this query
+       answers about the MLE's text, whatever system font it chose. */
+    if( gMleLineH <= 0 )
+        {
+        const HPS hps = WinGetPS( h );
+        FONTMETRICS fm;
+        if( hps != 0 && GpiQueryFontMetrics( hps, (LONG) sizeof( fm ), &fm ) )
+            gMleLineH = fm.lMaxBaselineExt;
+        if( hps != 0 )
+            WinReleasePS( hps );
+        if( gMleLineH < 8 )
+            gMleLineH = 16;   // a floor, not a measurement: never zero
+        if( gLog != 0 )
+            fprintf( gLog, "entry lineh %ld\n", (long) gMleLineH ),
+                fflush( gLog );
+        }
+    return h;
+}
+
+/* Empty the prompt after a submit.  The toolkit sample surface offers no
+   proven clear message -- import inserts, export reads -- so the control
+   is returned to its birth state the one way that needs no faith: the
+   window made for this moment is unmade and re-made.  That re-applies
+   the text limit and the subclass with the same calls that just worked,
+   and a submit happens once per message, not once per keystroke. */
+static void pmEntryReset( void )
+{
+    if( gEntry == 0 )
+        return;
+    const Boolean wasFocused = ( WinQueryFocus( gFrame ) == gEntry );
+    WinDestroyWindow( gEntry );
+    gEntry = pmCreateEntry();
+    gEntryLines = 1;
+    if( gEntry != 0 && wasFocused && gKeysOnPage == 0 )
+        WinSetFocus( gGroup, gEntry );
+    if( gGroup != 0 )
+        WinSendMsg( gGroup, WM_SIZE, MPVOID, MPVOID );
+}
+
+/* The strip the prompt wants, from the wrapped-line count the control
+   reports.  MLM_QUERYLINECOUNT's argument form is the one thing the
+   mirrors do not spell out (no sample uses it), so the answer is
+   believed only when it is sane: 1..512.  Anything else freezes the
+   strip at what it is and says so once -- a prompt that stopped growing
+   is a prompt still working; a driver acting on a garbage count is not.
+   The other signal -- the MLE's own vertical-overflow notification, in
+   pixels, struct and all in our headers -- grows the strip regardless,
+   so a silent line-count costs only the shrinking. */
+static void pmEntryNotice( void )
+{
+    if( gEntry == 0 || gMleLineH <= 0 || gGroup == 0 )
+        return;
+    /* One forensic line before the first query: if the control's answer
+       ever kills the session -- it is the one MLE call the mirrors show
+       no sample making -- the log's last word names it, and the fix is
+       deleting the call, the overflow notifications growing the strip
+       alone. */
+    static Boolean sQueried = False;
+    if( !sQueried && gLog != 0 )
+        {
+        sQueried = True;
+        fprintf( gLog, "entry linecount try\n" ), fflush( gLog );
+        }
+    const LONG lines = (LONG) WinSendMsg( gEntry, MLM_QUERYLINECOUNT,
+                                          MPVOID, MPVOID );
+    if( lines < 1 || lines > 512 )
+        {
+        static Boolean sRefused = False;
+        if( !sRefused && gLog != 0 )
+            {
+            sRefused = True;
+            fprintf( gLog, "entry linecount refused rc=%ld\n", (long) lines ),
+                fflush( gLog );
+            }
+        return;
+        }
+    if( lines == gEntryLines )
+        return;
+    gEntryLines = lines;
+
+    /* Never take the page below its minimum: the strip's growth clamps
+       there and the MLE scrolls its own overflow from then on. */
+    RECTL r;
+    WinQueryWindowRect( gGroup, &r );
+    LONG maxH = ( r.yTop - r.yBottom ) - gStatusH
+                - (LONG) kMinRows * (LONG) gCellPxH;
+    if( maxH < gEntryH1 )
+        maxH = gEntryH1;
+    LONG want = gEntryH1 + ( lines - 1 ) * gMleLineH;
+    if( want > maxH )
+        want = maxH;
+    if( want < gEntryH1 )
+        want = gEntryH1;
+    if( want == gEntryH )
+        return;
+    gEntryH = want;
+    static int sGrowLogs = 0;
+    if( sGrowLogs < 12 && gLog != 0 )
+        {
+        ++sGrowLogs;
+        fprintf( gLog, "entry lines %ld h %ld\n", (long) lines,
+                 (long) gEntryH ), fflush( gLog );
+        }
+    WinSendMsg( gGroup, WM_SIZE, MPVOID, MPVOID );
+}
+
 static MRESULT EXPENTRY pmEntryProc( HWND hwnd, ULONG msg,
                                      MPARAM mp1, MPARAM mp2 )
 {
@@ -1168,22 +1329,42 @@ static MRESULT EXPENTRY pmEntryProc( HWND hwnd, ULONG msg,
                 }
             if( ch == 0x0D )
                 {
-                char text[ 1024 ];
-                LONG n = WinQueryWindowText( hwnd, (ULONG) ( sizeof( text ) - 1 ),
-                                             text );
+                /* Enter submits.  The MLE would insert a newline, so
+                   the character stops here; the message is one logical
+                   line whatever the user pasted into it (export hands
+                   CR/LF back from wrapped and pasted text both, and
+                   both become spaces).  The read is the toolkit's
+                   proven export pattern, and the reset re-makes the
+                   control rather than trust an unproven clear. */
+                static char text[ kEntryMaxChars + 2 ];
+                LONG n = (LONG) WinSendMsg( hwnd, MLM_QUERYTEXTLENGTH,
+                                            MPVOID, MPVOID );
                 if( n < 0 )
                     n = 0;
-                if( n > (LONG) sizeof( text ) - 1 )
+                if( n > kEntryMaxChars )
                     {
-                    n = (LONG) sizeof( text ) - 1;
+                    n = kEntryMaxChars;
                     if( gLog != 0 )
-                        fprintf( gLog, "entry submit: truncated\n" ), fflush( gLog );
+                        fprintf( gLog, "entry submit: truncated\n" ),
+                            fflush( gLog );
                     }
-                text[n] = '\0';
-                WinSetWindowText( hwnd, (PSZ) "" );
+                ULONG off = 0;
+                ULONG cb = (ULONG) n;
+                WinSendMsg( hwnd, MLM_SETIMPORTEXPORT, MPFROMP( text ),
+                            MPFROMLONG( (LONG) sizeof( text ) - 1 ) );
+                WinSendMsg( hwnd, MLM_EXPORT, MPFROMP( &off ),
+                            MPFROMLONG( &cb ) );
+                if( cb > (ULONG) sizeof( text ) - 1 )
+                    cb = (ULONG) sizeof( text ) - 1;
+                text[ cb ] = '\0';
+                for( ULONG i = 0; i < cb; ++i )
+                    if( text[ i ] == '\r' || text[ i ] == '\n' )
+                        text[ i ] = ' ';
                 if( gLog != 0 )
-                    fprintf( gLog, "entry submit len=%ld\n", (long) n ), fflush( gLog );
-                if( n > 0 )
+                    fprintf( gLog, "entry submit len=%lu\n", (unsigned long) cb ),
+                        fflush( gLog );
+                pmEntryReset();
+                if( cb > 0 )
                     pmPromptSubmit( text );
                 return 0;
                 }
@@ -1230,12 +1411,30 @@ static MRESULT EXPENTRY pmGroupProc( HWND hwnd, ULONG msg,
         if( gStatusBar != 0 )
             WinSetWindowPos( gStatusBar, 0, 0, 0, w, gStatusH,
                              SWP_SIZE | SWP_MOVE | SWP_SHOW );
+        /* The page's height must be an exact number of cells -- its own
+           WM_SIZE derives the grid from pixels by whole division, and
+           any remainder would be an unpainted band -- so the rows go
+           first, from the prompt's wanted height, and the leftover
+           pixels join the prompt.  A prompt a few pixels taller than it
+           asked for is invisible; a transcript band of dead gray is
+           not.  gEntryH itself stays what the growth logic believes:
+           this absorption is the tiling's business, and the next
+           resize or grow recomputes from the same number. */
+        LONG rows = ( h - gStatusH - gEntryH ) / (LONG) gCellPxH;
+        if( rows < kMinRows )
+            rows = kMinRows;
+        const LONG pageH = rows * (LONG) gCellPxH;
+        LONG entryH = 0;
         if( gEntry != 0 )
-            WinSetWindowPos( gEntry, 0, 0, gStatusH, w, gEntryH,
+            {
+            entryH = h - gStatusH - pageH;
+            if( entryH < 0 )
+                entryH = 0;
+            WinSetWindowPos( gEntry, 0, 0, gStatusH, w, entryH,
                              SWP_SIZE | SWP_MOVE | SWP_SHOW );
-        const LONG pageH = h - gStatusH - gEntryH;
+            }
         if( gClient != 0 && pageH > 0 )
-            WinSetWindowPos( gClient, 0, 0, gStatusH + gEntryH, w, pageH,
+            WinSetWindowPos( gClient, 0, 0, gStatusH + entryH, w, pageH,
                              SWP_SIZE | SWP_MOVE | SWP_SHOW );
         return 0;
         }
@@ -1264,6 +1463,56 @@ static MRESULT EXPENTRY pmGroupProc( HWND hwnd, ULONG msg,
         return 0;
         }
 
+    /* The prompt's own voice.  WM_CONTROL carries both signals the
+       strip's growth listens for.  MLN_PIXVERTOVERFLOW -- and its
+       text-level cousin MLN_OVERFLOW -- arrive with mp2 pointing at the
+       overflow struct (the toolkit's MLEOVERFLOW, copied above, because
+       Watcom declares the notification codes but ships no header for
+       the payload): the control itself saying how many pixels its
+       wrapped text stands short, which needs no faith in any undocumented
+       count.  The sanity bound matters: if this PM's MLE carries the
+       struct somewhere else and mp2 is really the control's window
+       handle, the bound ignores the nonsense rather than laying out
+       with it.  MLN_CHANGE -- text or selection moved -- re-asks the
+       line count, the one signal that can shrink the strip again; here
+       mp2 is the ordinary control handle and the comparison holds. */
+    case WM_CONTROL:
+        {
+        const USHORT note = SHORT2FROMMP( mp1 );
+        if( note == MLN_PIXVERTOVERFLOW || note == MLN_OVERFLOW )
+            {
+            const ATUIMLEOVER *ov = (const ATUIMLEOVER *) PVOIDFROMMP( mp2 );
+            if( ov != 0 && ov->pixVertOver > 0 && ov->pixVertOver <= 512 )
+                {
+                RECTL r;
+                WinQueryWindowRect( hwnd, &r );
+                LONG maxH = ( r.yTop - r.yBottom ) - gStatusH
+                            - (LONG) kMinRows * (LONG) gCellPxH;
+                if( maxH < gEntryH1 )
+                    maxH = gEntryH1;
+                const LONG want = gEntryH + ov->pixVertOver;
+                if( want > gEntryH && want <= maxH )
+                    {
+                    gEntryH = want;
+                    static int sOverLogs = 0;
+                    if( sOverLogs < 8 && gLog != 0 )
+                        {
+                        ++sOverLogs;
+                        fprintf( gLog, "entry vover %ld h %ld\n",
+                                 (long) ov->pixVertOver, (long) gEntryH ),
+                            fflush( gLog );
+                        }
+                    WinSendMsg( hwnd, WM_SIZE, MPVOID, MPVOID );
+                    }
+                }
+            return 0;
+            }
+        if( gEntry != 0 && (HWND) PVOIDFROMMP( mp2 ) == gEntry
+            && note == MLN_CHANGE )
+            pmEntryNotice();
+        return 0;
+        }
+
     /* Menu picks from the frame's PM menu.  PM delivers them to the
        client window -- the frame's default procedure forwards them --
        and the client is this group now.  Each id becomes the hot key
@@ -1271,7 +1520,7 @@ static MRESULT EXPENTRY pmGroupProc( HWND hwnd, ULONG msg,
        chrome round this case sat on what is now the page window, and
        when the group took over the client's seat the deliveries came
        here instead -- and silently stopped (measured: a File-menu
-       session without one \"command\" line in the log). */
+       session without one "command" line in the log). */
     case WM_COMMAND:
         pmTakeCommand( (int) SHORT1FROMMP( mp1 ) );
         return 0;
@@ -2067,29 +2316,14 @@ static void pmOpenWindow()
         }
     else
         pmLogErr( "status create" );
-    gEntry = WinCreateWindow( gGroup, WC_ENTRYFIELD, "",
-                              WS_VISIBLE | WS_TABSTOP | ES_MARGIN
-                                | ES_AUTOSCROLL,
-                              0, 0, 0, 0, gGroup, HWND_TOP,
-                              0, NULL, NULL );
+    gEntry = pmCreateEntry();
     if( gEntry != 0 )
-        {
-        gOldEntryProc = WinSubclassWindow( gEntry, pmEntryProc );
-        if( gOldEntryProc == 0 )
-            pmLogErr( "entry subclass" );
-        /* A fresh WC_ENTRYFIELD stops at 32 characters -- PM's default
-           text limit, measured on this very window (reported: "accepts
-           only up to 32").  The toolkit's own samples lift it the same
-           way (dragdrop.c:619 raises a path field to 256); here it
-           goes to one short of the submit buffer pmEntryProc reads,
-           so that read can never truncate what the field accepted. */
-        WinSendMsg( gEntry, EM_SETTEXTLIMIT, MPFROM2SHORT( 1023, 0 ),
-                    MPVOID );
-        }
+        gEntryH1 = gEntryH;   // the one-line baseline growth adds to
     else
         {
         pmLogErr( "entry create" );
         gEntryH = 0;
+        gEntryH1 = 0;
         }
     if( gStatusBar == 0 )
         gStatusH = 0;
