@@ -1154,6 +1154,18 @@ static MRESULT EXPENTRY pmEntryProc( HWND hwnd, ULONG msg,
             {
             const short ch = (short) SHORT1FROMMP( mp2 );
             const uchar scan = (uchar) CHAR4FROMMP( mp1 );
+            /* Alt chords belong to the application, not the field.
+               Before the chrome round the page window received them
+               and pmTakeChar forwarded them -- it is the only keyboard
+               path the status line's promises (Alt-H, Alt-X) ever
+               had -- and the field must not swallow a promise.
+               Forward exactly what the page forwarded, extraction
+               and all. */
+            if( ( flags & kKcAlt ) != 0 )
+                {
+                pmTakeChar( flags, ch, (ushort) SHORT2FROMMP( mp2 ), scan );
+                return 0;
+                }
             if( ch == 0x0D )
                 {
                 char text[ 1024 ];
@@ -1251,6 +1263,18 @@ static MRESULT EXPENTRY pmGroupProc( HWND hwnd, ULONG msg,
             }
         return 0;
         }
+
+    /* Menu picks from the frame's PM menu.  PM delivers them to the
+       client window -- the frame's default procedure forwards them --
+       and the client is this group now.  Each id becomes the hot key
+       the application already answers (see pmTakeCommand).  Before the
+       chrome round this case sat on what is now the page window, and
+       when the group took over the client's seat the deliveries came
+       here instead -- and silently stopped (measured: a File-menu
+       session without one \"command\" line in the log). */
+    case WM_COMMAND:
+        pmTakeCommand( (int) SHORT1FROMMP( mp1 ) );
+        return 0;
 
     case WM_ERASEBACKGROUND:
         // The three children cover the group with their own painting; the
@@ -1580,13 +1604,10 @@ static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
     // releases outside it -- eFTE ships on exactly that and never drops a
     // held button, so the state above stays honest without asking.
 
-    case WM_COMMAND:
-        // Menu picks from the frame's PM menu.  PM delivers them to the
-        // client window -- the frame's default procedure forwards them --
-        // and each id becomes the hot key the application already answers
-        // (see pmTakeCommand).
-        pmTakeCommand( (int) SHORT1FROMMP( mp1 ) );
-        return 0;
+    /* WM_COMMAND from the frame's menu lands on the client window, and
+       the client is the group now -- the case lives there, where PM
+       sends the message.  The page has no control children of its own,
+       so there is nothing for it to answer. */
 
     case WM_CLOSE:
         // The way out the user expects from a window: the application is
@@ -2056,6 +2077,14 @@ static void pmOpenWindow()
         gOldEntryProc = WinSubclassWindow( gEntry, pmEntryProc );
         if( gOldEntryProc == 0 )
             pmLogErr( "entry subclass" );
+        /* A fresh WC_ENTRYFIELD stops at 32 characters -- PM's default
+           text limit, measured on this very window (reported: "accepts
+           only up to 32").  The toolkit's own samples lift it the same
+           way (dragdrop.c:619 raises a path field to 256); here it
+           goes to one short of the submit buffer pmEntryProc reads,
+           so that read can never truncate what the field accepted. */
+        WinSendMsg( gEntry, EM_SETTEXTLIMIT, MPFROM2SHORT( 1023, 0 ),
+                    MPVOID );
         }
     else
         {
