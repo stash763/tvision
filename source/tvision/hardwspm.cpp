@@ -311,47 +311,59 @@ static int    gVsbLogs   = 0;   // the bar's first twelve WM_VSCROLLs
    system's own menu row is the measured version of the same number. */
 static HWND   gGroup        = 0;
 static HWND   gEntry        = 0;
-static PFNWP  gOldEntryProc = 0;
 static HWND   gStatusBar    = 0;
 static LONG   gEntryH       = 0;
 static LONG   gStatusH      = 0;
 static int    gKeysOnPage   = 0;   // the kit's keysToPage counter
 static Boolean gEntryFocusLogged = False;
 
-/* The prompt is a WC_MLE: the single line of a WC_ENTRYFIELD fits neither
-   of the two things asked of it -- word wrap, hard newlines on Shift+
-   Enter, and a box that grows as the message gains lines (measured
-   against the entry field: it also carried PM's default 32-character
-   ceiling).  Everything MLE here speaks comes from Watcom's own headers
-   (MLM_*, MLS_*, MLN_*, WC_MLE all present), from the toolkit's
-   controls sample (create/import/export, sty_dlg.c:1705,
-   sty_file.c:475) and from mcispy.c (MLM_DELETE's clear range, :227).
-   The MLEOVERFLOW shape is the toolkit pmmle.h's, copied because
-   Watcom ships no header for it.
+/* The prompt is the driver's own window: a buffer, a layout, drawing.
+   WC_MLE held the seat for two rounds and answered none of the three
+   questions that matter to a prompt -- in two sessions of typing it
+   sent not one WM_CHAR to the subclass (Enter included: zero submit
+   lines), not one MLN_CHANGE or MLN_OVERFLOW notification, and
+   MLM_QUERYTEXTLENGTH kept answering zero across 500 wait beats with
+   text going in (measured, atuipm.run.txt twice).  The class works --
+   the user typed into it -- but it speaks MMPM/2's older ways, and the
+   mirrors cannot say which message forms or notification paths this
+   eCS build honors.  A window of our own has no such unknowns: WM_CHAR
+   arrives (the page proves that with every keystroke the application
+   ever saw), WinSetFocus works on it, GPI text draws with calls whose
+   imports resolve on this box (probed 2026-11-02: GpiCharStringAt et
+   al link, while WinCreateCaret et al do NOT -- os2386.lib is minimal,
+   so the cursor is drawn, eFTE's way, with WinFillRect).
      gEntryH1     one line's worth of strip, the birth formula's value;
-     gMleLineH    px per extra wrapped line, measured from the control's
-                  own font (GpiQueryFontMetrics on WinGetPS -- the window
-                  DC carries the window's font), lMaxBaselineExt;
-     gPromptLen   the text length seen last beat; -1 demands a recount.
-   Notifications are not the engine: the box sent not one MLN_CHANGE in
-   a session of typing (measured, atuipm.run.txt), so growth rides the
-   wait loop's beat -- pmPromptPoll -- and the notification handler
-   below only makes an already-arrived signal act at once.
-   Text ceiling: PM's entry-field default is 32; the MLE is memory-bound,
-   so the limit is one we state: kEntryMaxChars via MLM_SETTEXTLIMIT. */
+     gMleLineH    px per line, measured from the window's own font
+                  (GpiQueryFontMetrics on WinGetPS), lMaxBaselineExt;
+     gMleDesc     the same font's descent, to place the baseline;
+     gPText/...   the text itself: '\n'-separated paragraphs up to
+                  kEntryMaxChars, the caret and selection indexes, and
+                  the wrapped-line cache the editing keys walk.
+   Named keys arrive as WM_CHAR carrying virt codes -- the kVirt table
+   above is the box's proven translation of them -- so this window
+   needs no message or scan-code constant the page has not already
+   used. */
 static LONG   gEntryH1      = 0;
 static LONG   gMleLineH     = 0;
-static LONG   gPromptLen    = -1;
-static LONG   gPromptW      = 0;
+static LONG   gMleDesc      = 0;
 static const LONG kEntryMaxChars = 4096;
 
-typedef struct _ATUIMLEOVER    /* the toolkit's MLEOVERFLOW (pmmle.h) */
-    {
-    ULONG afErrInd;
-    LONG  nBytesOver;
-    LONG  pixHorzOver;
-    LONG  pixVertOver;
-    } ATUIMLEOVER;
+static char   gPText[ kEntryMaxChars + 2 ];
+static LONG   gPLen   = 0;            // characters in gPText
+static LONG   gPCaret = 0;            // caret index, 0..gPLen
+static LONG   gPAnchor = -1;          // other end of the selection, -1 = none
+static LONG   gPTop   = 0;            // first visible layout line
+static LONG   gPWidth = 0;            // client width the layout knows
+
+/* The wrapped-line cache: display lines as (start,length) spans of
+   gPText.  4k characters wrap to at most 4k+1 lines; the arrays hold
+   the worst case so the caret arithmetic never runs off the end. */
+enum { kMaxLayoutLines = 4200 };
+static LONG   gLStart[ kMaxLayoutLines ];
+static LONG   gLLen[ kMaxLayoutLines ];
+static LONG   gLLines = 1;
+
+static const LONG kPromptPadPx = 6;   // inside the drawn border: text margin
 
 /* The transcript is app knowledge; the bar is the driver's.  app.cpp
    (src/tui) implements the first two -- extent of the line list, and a
@@ -1165,286 +1177,599 @@ static void pmSnapSWP( HWND hwndFrame, PSWP pswp )
     pswp->cy = newCy;
 }
 
-/* The prompt's own procedure -- the driver answers for the few keys the
-   control cannot know the meaning of, and lets the MLE be an editor for
-   every one it does: the arrows, Home/End, selection, the clipboard, its
-   own Ctrl-Z undo -- all PM's, none of this driver's business.
+/* The prompt engine: pmPromptLayout_ re-wraps the buffer over the
+   window's width and drives the strip's height from the result;
+   pmPromptProc is the window procedure of the driver's own prompt
+   class (registered with the others in pmOpenWindow).  Both are
+   defined below; the birth below already wants their addresses. */
+static void pmPromptLayout_( void );
+static MRESULT EXPENTRY pmPromptProc( HWND hwnd, ULONG msg,
+                                      MPARAM mp1, MPARAM mp2 );
 
-   Enter submits and stops there; Shift+Enter is deliberately not caught,
-   and the MLE inserts its hard newline -- a message may be many
-   paragraphs.  The read is the toolkit's proven export pattern, the
-   clear mcispy's MLM_DELETE range.  PgUp/
-   PgDn belong to the transcript, found by scan code (0x49/0x51), the
-   same identifiers that made the injected pages land.  Ctrl-T toggles
-   the thinking blocks.  Alt chords are forwarded to the application:
-   they are the only keyboard path the status line's promises (Alt-H,
-   Alt-X) ever had, and a control must not swallow a promise. */
-static MRESULT EXPENTRY pmEntryProc( HWND hwnd, ULONG msg,
-                                     MPARAM mp1, MPARAM mp2 );
-
-/* Make the prompt.  Everything it says to the MLE is
-   Watcom-declared and toolkit-patterned; the text limit's return value
-   -- how many characters actually fit -- goes to the log, so if the
-   control ever refuses the arrangement the box says so on the first
-   line the user reads. */
+/* Make the prompt: the driver's own class, whose every drawing call
+   resolved on this box (the GPI text family was probed for it).  Font
+   metrics come from the window's own PS -- the same measurement that
+   has answered 20 pixels every round -- and the descent rides along
+   so the text baseline and the drawn caret land inside the line box. */
 static HWND pmCreateEntry( void )
 {
-    const HWND h = WinCreateWindow( gGroup, WC_MLE, "",
-                                    WS_VISIBLE | WS_TABSTOP | MLS_WORDWRAP
-                                      | MLS_BORDER,
+    const HWND h = WinCreateWindow( gGroup, "AtuiPrompt", "",
+                                    WS_VISIBLE | WS_TABSTOP,
                                     0, 0, 0, 0, gGroup, HWND_TOP,
                                     0, NULL, NULL );
     if( h == 0 )
         return 0;
-    gOldEntryProc = WinSubclassWindow( h, pmEntryProc );
-    if( gOldEntryProc == 0 )
-        pmLogErr( "entry subclass" );
-    const LONG fit = (LONG) WinSendMsg( h, MLM_SETTEXTLIMIT,
-                                        MPFROMLONG( kEntryMaxChars ),
-                                        MPVOID );
-    if( gLog != 0 )
-        fprintf( gLog, "entry limit %ld fit %ld\n", kEntryMaxChars, fit ),
-            fflush( gLog );
-    /* Pixels per wrapped line, measured not guessed: a PM window's own
-       GPI presentation space carries that window's font, so this query
-       answers about the MLE's text, whatever system font it chose. */
     if( gMleLineH <= 0 )
         {
         const HPS hps = WinGetPS( h );
         FONTMETRICS fm;
         if( hps != 0 && GpiQueryFontMetrics( hps, (LONG) sizeof( fm ), &fm ) )
+            {
             gMleLineH = fm.lMaxBaselineExt;
+            gMleDesc  = fm.lMaxDescender;   // Watcom's name for the descent
+            }
         if( hps != 0 )
             WinReleasePS( hps );
         if( gMleLineH < 8 )
             gMleLineH = 16;   // a floor, not a measurement: never zero
+        if( gMleDesc < 0 || gMleDesc > gMleLineH / 3 )
+            gMleDesc = 3;     // plausible-range guard: a descent is a sliver
         if( gLog != 0 )
-            fprintf( gLog, "entry lineh %ld\n", (long) gMleLineH ),
-                fflush( gLog );
+            fprintf( gLog, "entry lineh %ld desc %ld\n",
+                     (long) gMleLineH, (long) gMleDesc ), fflush( gLog );
         }
     return h;
 }
 
-/* The wrapped-line count of the prompt's text, computed locally: the
-   arithmetic is the driver's own, run against the control's text and
-   the control's own font.  MLM_QUERYLINECOUNT's argument form the
-   mirrors never show, and the notifications never came -- so the text
-   is exported with proven calls, split at hard newlines (Shift+Enter
-   and pasted blocks), and each hard line is greedy-wrapped against the
-   box's width minus a generous gutter, word by word, measured with
-   GpiQueryTabbedTextExtent on the window's PS.  Miscounts err tall --
-   an MLE taller than its text is invisible; one shorter hides the
-   caret, which is not.  Text longer than a line splits mid-word as the
-   MLE itself would split it. */
-static LONG pmPromptLines_( const char *text, LONG len, LONG width )
+/* Which layout line holds this buffer index.  Linear: the worst case
+   is a few thousand entries and it runs once per keystroke, on text
+   the size of a prompt, which is nothing even for the slower box. */
+static LONG pmPromptLineOf_( LONG index )
 {
-    if( len <= 0 )
-        return 1;
-    LONG avail = width - 16;   // MLS_BORDER and the MLE's margins, over-counted
-    if( avail < 48 )
-        avail = 48;
+    LONG i = 0;
+    while( i + 1 < gLLines
+           && index >= gLStart[i] + ( gLLen[i] > 0 ? gLLen[i] : 1 ) )
+        ++i;
+    return i;
+}
+
+/* Lay the text out over the window's width: every display line
+   becomes a (start,length) span.  Greedy word fill, spaces at a wrap
+   point belong to no line, and a word longer than a line splits by
+   average character width -- measured, so the split never claims more
+   than fits, and the caret arithmetic stays exact. */
+static void pmPromptLayout_( void )
+{
+    if( gEntry == 0 || gMleLineH <= 0 )
+        return;
+    RECTL r;
+    WinQueryWindowRect( gEntry, &r );
+    const LONG w = r.xRight - r.xLeft;
+    gPWidth = w;
+    LONG avail = w - 2 * kPromptPadPx;
+    if( avail < 32 )
+        avail = 32;
     const HPS hps = WinGetPS( gEntry );
     if( hps == 0 )
-        return 1;              // cannot measure: move nothing
+        return;                 // cannot measure: leave the layout alone
     const LONG spw = (LONG) GpiQueryTabbedTextExtent( hps, 1, (PCH) " ",
                                                       0, NULL );
-    LONG total = 0;
+    gLLines = 0;
     LONG a = 0;
     for( ;; )
         {
         LONG b = a;
-        while( b < len && text[b] != '\n' )
+        while( b < gPLen && gPText[b] != '\n' )
             ++b;
-        LONG count = 1, x = 0, pending = 0;
-        LONG j = a;
-        while( j < b )
+        LONG segStart = a, x = 0, pending = 0, j = a;
+        for( ;; )
             {
-            if( text[j] == ' ' )
+            if( j >= b )        // end of the hard line: emit what remains
+                {
+                if( gLLines < kMaxLayoutLines )
+                    { gLStart[gLLines] = segStart;
+                      gLLen[gLLines] = j - segStart; ++gLLines; }
+                break;
+                }
+            if( gPText[j] == ' ' )
                 { ++pending; ++j; continue; }
             LONG k = j;
-            while( k < b && text[k] != ' ' )
+            while( k < b && gPText[k] != ' ' )
                 ++k;
             const LONG ww = (LONG) GpiQueryTabbedTextExtent(
-                hps, (LONG) ( k - j ), (PCH) ( text + j ), 0, NULL );
-            LONG need = ww + ( x > 0 ? pending * spw : 0 );
-            if( x > 0 && x + need > avail )
-                { ++count; x = 0; need = ww; }   // the break eats its spaces
-            while( x + need > avail )
-                { ++count; x = 0; need -= avail; }
-            x += need;
-            pending = 0;
+                hps, (LONG) ( k - j ), (PCH) ( gPText + j ), 0, NULL );
+            const LONG gap = pending * spw;   // leading spaces count too:
+                                              // an indent is not free width
+            if( x > 0 && x + gap + ww > avail )
+                {                 // break before the word; its spaces die
+                if( gLLines < kMaxLayoutLines )
+                    { gLStart[gLLines] = segStart;
+                      gLLen[gLLines] = ( j - pending ) - segStart;
+                      ++gLLines; }
+                segStart = j; x = 0; pending = 0;
+                }
+            if( ww > avail )    // longer than one line: split it
+                {
+                LONG chunk = (LONG) ( ( (double) ( k - j )
+                                        * (double) avail )
+                                      / (double) ( ww > 0 ? ww : 1 ) );
+                if( chunk < 1 )
+                    chunk = 1;
+                chunk -= 1;     // the average is optimistic; leave a sliver
+                if( chunk < 1 )
+                    chunk = 1;
+                if( x > 0 )
+                    {
+                    if( gLLines < kMaxLayoutLines )
+                        { gLStart[gLLines] = segStart;
+                          gLLen[gLLines] = j - segStart; ++gLLines; }
+                    segStart = j;
+                    }
+                LONG taken = 0;
+                while( k - j - taken > chunk )
+                    {
+                    if( gLLines < kMaxLayoutLines )
+                        { gLStart[gLLines] = segStart + taken;
+                          gLLen[gLLines] = chunk; ++gLLines; }
+                    taken += chunk;
+                    }
+                segStart += taken;
+                x = (LONG) GpiQueryTabbedTextExtent(
+                    hps, (LONG) ( k - segStart ), (PCH) ( gPText + segStart ),
+                    0, NULL );
+                j = k; pending = 0;
+                continue;
+                }
+            x += gap + ww;
             j = k;
+            pending = 0;
             }
-        total += count;
-        if( b >= len )
+        if( b >= gPLen )
             break;
         a = b + 1;
         }
+    if( gLLines == 0 )
+        { gLStart[0] = 0; gLLen[0] = 0; gLLines = 1; }
     WinReleasePS( hps );
-    return total > 0 ? total : 1;
-}
 
-/* The strip the prompt wants, driven from the wait loop's beat next to
-   pmSyncScrollBar's.  MLM_QUERYTEXTLENGTH is proven and cheap, so a
-   beat with nothing new costs one message and two compares; exporting
-   and counting happen only when the length -- or the box's width --
-   changed. */
-static void pmPromptPoll( void )
-{
-    if( gEntry == 0 || gMleLineH <= 0 || gGroup == 0 )
-        return;
-    const LONG len = (LONG) WinSendMsg( gEntry, MLM_QUERYTEXTLENGTH,
-                                        MPVOID, MPVOID );
-    RECTL er;
-    WinQueryWindowRect( gEntry, &er );
-    const LONG width = er.xRight - er.xLeft;
-    if( len == gPromptLen && width == gPromptW )
-        return;
-    gPromptLen = len;
-    gPromptW = width;
-    LONG lines = 1;
-    LONG n = len;
-    if( n < 0 )
-        n = 0;
-    if( n > kEntryMaxChars )
-        n = kEntryMaxChars;
-    if( n > 0 )
-        {
-        static char text[ kEntryMaxChars + 2 ];
-        ULONG off = 0;
-        ULONG cb = (ULONG) n;
-        WinSendMsg( gEntry, MLM_SETIMPORTEXPORT, MPFROMP( text ),
-                    MPFROMLONG( (LONG) sizeof( text ) - 1 ) );
-        WinSendMsg( gEntry, MLM_EXPORT, MPFROMP( &off ), MPFROMLONG( &cb ) );
-        if( cb > (ULONG) sizeof( text ) - 1 )
-            cb = (ULONG) sizeof( text ) - 1;
-        lines = pmPromptLines_( text, (LONG) cb, width );
-        }
-    /* Never take the page below its minimum: the strip clamps there and
-       the MLE scrolls its own overflow from then on. */
-    RECTL r;
-    WinQueryWindowRect( gGroup, &r );
-    LONG maxH = ( r.yTop - r.yBottom ) - gStatusH
+    // Keep the caret on screen: the strip shows its own lines' worth.
+    const LONG caretLine = pmPromptLineOf_( gPCaret );
+    LONG vis = ( gEntryH - 2 * kPromptPadPx ) / gMleLineH;
+    if( vis < 1 )
+        vis = 1;
+    if( caretLine < gPTop )
+        gPTop = caretLine;
+    if( caretLine >= gPTop + vis )
+        gPTop = caretLine - vis + 1;
+
+    // Grow the strip with the lines; never take the page below its minimum.
+    RECTL gr;
+    WinQueryWindowRect( gGroup, &gr );
+    LONG maxH = ( gr.yTop - gr.yBottom ) - gStatusH
                 - (LONG) kMinRows * (LONG) gCellPxH;
     if( maxH < gEntryH1 )
         maxH = gEntryH1;
-    LONG want = gEntryH1 + ( lines - 1 ) * gMleLineH;
+    LONG want = gEntryH1 + ( gLLines - 1 ) * gMleLineH;
     if( want > maxH )
         want = maxH;
     if( want < gEntryH1 )
         want = gEntryH1;
-    if( want == gEntryH )
-        return;
-    gEntryH = want;
-    static int sGrowLogs = 0;
-    if( sGrowLogs < 16 && gLog != 0 )
+    if( want != gEntryH )
         {
-        ++sGrowLogs;
-        fprintf( gLog, "entry grow len %ld lines %ld h %ld\n",
-                 (long) len, (long) lines, (long) gEntryH ), fflush( gLog );
+        gEntryH = want;
+        static int sGrowLogs = 0;
+        if( sGrowLogs < 16 && gLog != 0 )
+            {
+            ++sGrowLogs;
+            fprintf( gLog, "prompt grow lines %ld h %ld\n",
+                     (long) gLLines, (long) gEntryH ), fflush( gLog );
+            }
+        WinSendMsg( gGroup, WM_SIZE, MPVOID, MPVOID );
         }
-    WinSendMsg( gGroup, WM_SIZE, MPVOID, MPVOID );
+    WinInvalidateRect( gEntry, NULL, False );
 }
 
-static MRESULT EXPENTRY pmEntryProc( HWND hwnd, ULONG msg,
-                                     MPARAM mp1, MPARAM mp2 )
+/* Replace [from,to) with n bytes of ins, keep every index sane, and
+   let the layout answer for the screen.  Overflow truncates the
+   insertion at the ceiling: 4k is the promise, and a beep cannot add
+   characters either. */
+static void pmPromptReplace_( LONG from, LONG to, const char *ins, LONG n )
 {
-    if( msg == WM_CHAR )
+    if( from < 0 )
+        from = 0;
+    if( to < from )
+        to = from;
+    if( to > gPLen )
+        to = gPLen;
+    if( from > gPLen )
+        from = gPLen;
+    if( gPLen - ( to - from ) + n > kEntryMaxChars )
+        n = kEntryMaxChars - ( gPLen - ( to - from ) );
+    if( n < 0 )
+        n = 0;
+    memmove( gPText + from + n, gPText + to, gPLen - to );
+    if( ins != 0 && n > 0 )
+        memcpy( gPText + from, ins, n );
+    gPLen += n - ( to - from );
+    gPCaret = from + n;
+    gPAnchor = -1;
+    pmPromptLayout_();
+}
+
+/* The selection's bounds in buffer order, or from == to == caret. */
+static void pmPromptSel_( LONG *from, LONG *to )
+{
+    if( gPAnchor < 0 || gPAnchor == gPCaret )
+        { *from = *to = gPCaret; return; }
+    if( gPAnchor < gPCaret )
+        { *from = gPAnchor; *to = gPCaret; }
+    else
+        { *from = gPCaret; *to = gPAnchor; }
+}
+
+/* One key of caret motion.  A held Shift grows the selection from
+   wherever it last rested; any other press collapses it. */
+static void pmPromptMove_( LONG target, Boolean shift )
+{
+    if( target < 0 )
+        target = 0;
+    if( target > gPLen )
+        target = gPLen;
+    if( shift )
+        {
+        if( gPAnchor < 0 )
+            gPAnchor = gPCaret;
+        }
+    else
+        gPAnchor = -1;
+    gPCaret = target;
+    pmPromptLayout_();
+}
+
+/* The prompt's own window procedure.  Every key fact here is one this
+   box has already proven about its own windows: WM_CHAR carries the
+   character, the virt code, the flags and the scan (the page has
+   delivered every keystroke this application ever saw with exactly
+   that extraction, and pmVirtualKey is the box-proven translation of
+   the named keys -- including the byte PgUp historically rode in on).
+
+   Enter submits; Shift+Enter inserts a hard newline and the message
+   may run paragraphs -- the buffer holds bare LFs and the model sees
+   the user's paragraphs as typed.  Tab is swallowed so focus stays in
+   the prompt (the frame has nothing else to give it).  Alt chords are
+   forwarded to the application: they are the only keyboard path the
+   status line's promises (Alt-H, Alt-X) ever had, and the prompt must
+   not swallow a promise.  Ctrl-T toggles thinking blocks, Ctrl-A
+   selects all, Ctrl-Backspace deletes a word, PgUp/PgDn belong to the
+   transcript.  The clipboard is the documented, deliberately skipped
+   phase: os2386.lib carries none of that family's imports (probed),
+   and paste gets no unproven link.
+     The cursor is drawn, not created: WinCreateCaret and its family
+   are not in os2386.lib -- measured, E2028 against every name -- so
+   the caret is a WinFillRect block, eFTE's own approach for its text
+   window. */
+static MRESULT EXPENTRY pmPromptProc( HWND hwnd, ULONG msg,
+                                      MPARAM mp1, MPARAM mp2 )
+{
+    switch( msg )
+        {
+    case WM_CHAR:
         {
         const ULONG flags = SHORT1FROMMP( mp1 );
-        if( ( flags & kKcKeyUp ) == 0 )
+        if( ( flags & kKcKeyUp ) != 0 )
+            return 0;
+        short ch = (short) SHORT1FROMMP( mp2 );
+        const ushort virt = (ushort) SHORT2FROMMP( mp2 );
+        uchar scan = (uchar) CHAR4FROMMP( mp1 );
+        if( virt != 0 )
             {
-            const short ch = (short) SHORT1FROMMP( mp2 );
-            const uchar scan = (uchar) CHAR4FROMMP( mp1 );
-            /* Alt chords belong to the application, not the field.
-               Before the chrome round the page window received them
-               and pmTakeChar forwarded them -- it is the only keyboard
-               path the status line's promises (Alt-H, Alt-X) ever
-               had -- and the field must not swallow a promise.
-               Forward exactly what the page forwarded, extraction
-               and all. */
-            if( ( flags & kKcAlt ) != 0 )
+            /* Named keys carry whatever byte historically *was* the
+               key -- PgUp's XON (see pmTakeChar's note); normalize
+               through the table the page already trusts. */
+            uchar nch = 0, nscan = 0;
+            ushort nmods = 0;
+            if( pmVirtualKey( virt, nch, nscan, nmods ) )
+                { ch = (short) nch; scan = nscan; }
+            }
+        if( ( flags & kKcAlt ) != 0 )
+            {
+            pmTakeChar( flags, ch, virt, scan );
+            return 0;
+            }
+        if( ( flags & kKcCtrl ) != 0 )
+            {
+            if( ch == 0x14 )                    // Ctrl-T
+                { pmToggleThinking(); return 0; }
+            if( ch == 0x01 )                    // Ctrl-A
+                { gPAnchor = 0; pmPromptMove_( gPLen, True ); return 0; }
+            if( ch == 0x08 )                    // Ctrl-Backspace: word
                 {
-                pmTakeChar( flags, ch, (ushort) SHORT2FROMMP( mp2 ), scan );
+                LONG u, v;
+                pmPromptSel_( &u, &v );
+                if( u != v )
+                    { pmPromptReplace_( u, v, 0, 0 ); return 0; }
+                LONG b = gPCaret;
+                while( b > 0 && gPText[ b - 1 ] == ' ' )
+                    --b;
+                while( b > 0 && gPText[ b - 1 ] != ' ' )
+                    --b;
+                pmPromptReplace_( b, gPCaret, 0, 0 );
                 return 0;
                 }
-            if( ch == 0x0D && ( ( flags & kKcShift ) == 0 ) )
+            return 0;                           // the rest is unbound
+            }
+        const Boolean shift = ( flags & kKcShift ) != 0;
+        LONG s, e;
+        switch( scan )
+            {
+        case 0x4B:                              // Left
+            pmPromptSel_( &s, &e );
+            pmPromptMove_( ( s != e && !shift ) ? s : gPCaret - 1, shift );
+            return 0;
+        case 0x4D:                              // Right
+            pmPromptSel_( &s, &e );
+            pmPromptMove_( ( s != e && !shift ) ? e : gPCaret + 1, shift );
+            return 0;
+        case 0x48:                              // Up
+        case 0x50:                              // Down
+            {
+            const LONG cl = pmPromptLineOf_( gPCaret );
+            const LONG nl = ( scan == 0x48 ) ? cl - 1 : cl + 1;
+            if( nl < 0 || nl >= gLLines )
+                return 0;
+            LONG col = gPCaret - gLStart[ cl ];
+            if( col > gLLen[ nl ] )
+                col = gLLen[ nl ];
+            pmPromptMove_( gLStart[ nl ] + col, shift );
+            return 0;
+            }
+        case 0x47:                              // Home: line, then top
+            {
+            const LONG ls = gLStart[ pmPromptLineOf_( gPCaret ) ];
+            pmPromptMove_( ( gPCaret == ls && ls > 0 ) ? 0 : ls, shift );
+            return 0;
+            }
+        case 0x4F:                              // End: to the line's end
+            {
+            const LONG cl = pmPromptLineOf_( gPCaret );
+            pmPromptMove_( gLStart[ cl ] + gLLen[ cl ], shift );
+            return 0;
+            }
+        case 0x49:                              // PgUp: the transcript's
+            pmTranscriptPage( -1 );
+            return 0;
+        case 0x51:                              // PgDn
+            pmTranscriptPage( 1 );
+            return 0;
+        case 0x53:                              // Del
+            pmPromptSel_( &s, &e );
+            if( s != e )
+                pmPromptReplace_( s, e, 0, 0 );
+            else if( gPCaret < gPLen )
+                pmPromptReplace_( gPCaret, gPCaret + 1, 0, 0 );
+            return 0;
+        case 0x52:                              // Ins: no type-over here
+            return 0;
+        default:
+            break;
+            }
+        if( ch == 0x0D )
+            {
+            if( shift )
                 {
-                /* Enter submits.  Shift+Enter is the exception the user
-                   asked for: it is not intercepted, and the MLE inserts
-                   a hard newline of its own -- the message can be many
-                   lines.  The read is the toolkit's proven export
-                   pattern; CR/LF arrive from wrapped and hard breaks
-                   alike, so they normalize to bare LF on the way out
-                   (the model sees the paragraphs the user typed).  The
-                   clear is mcispy's call -- MLM_DELETE from 0 to 65536
-                   (mcispy.c:227) -- which leaves focus and caret where
-                   they are, unlike re-creating the window. */
-                static char text[ kEntryMaxChars + 2 ];
-                LONG n = (LONG) WinSendMsg( hwnd, MLM_QUERYTEXTLENGTH,
-                                            MPVOID, MPVOID );
-                if( n < 0 )
-                    n = 0;
-                if( n > kEntryMaxChars )
+                pmPromptSel_( &s, &e );
+                pmPromptReplace_( s, e, "\n", 1 );
+                return 0;
+                }
+            if( gPLen == 0 )
+                return 0;                       // silence is not submitted
+            static char text[ kEntryMaxChars + 2 ];
+            memcpy( text, gPText, gPLen );
+            text[ gPLen ] = '\0';
+            if( gLog != 0 )
+                fprintf( gLog, "entry submit len=%ld\n", (long) gPLen ),
+                    fflush( gLog );
+            gPLen = 0;
+            gPCaret = 0;
+            gPAnchor = -1;
+            gPTop = 0;
+            pmPromptLayout_();
+            pmPromptSubmit( text );
+            return 0;
+            }
+        if( ch == 0x08 )
+            {
+            pmPromptSel_( &s, &e );
+            if( s != e )
+                pmPromptReplace_( s, e, 0, 0 );
+            else if( gPCaret > 0 )
+                pmPromptReplace_( gPCaret - 1, gPCaret, 0, 0 );
+            return 0;
+            }
+        if( ch == 0x09 )
+            return 0;                           // focus stays in the prompt
+        if( ch >= 0x20 )
+            {
+            pmPromptSel_( &s, &e );
+            const char c = (char) ch;
+            pmPromptReplace_( s, e, &c, 1 );
+            return 0;
+            }
+        return 0;
+        }
+
+    case WM_SETFOCUS:
+        if( !gEntryFocusLogged )
+            {
+            gEntryFocusLogged = True;
+            if( gLog != 0 )
+                fprintf( gLog, "focus entry hwnd=%p\n", hwnd ), fflush( gLog );
+            }
+        WinInvalidateRect( hwnd, NULL, False ); // the caret appears
+        return 0;
+
+    case kWmKillFocus:      // Watcom declares WM_SETFOCUS but not this one;
+                           // the file's own transcription is IBM's 0x0010
+        WinInvalidateRect( hwnd, NULL, False ); // the caret leaves
+        return 0;
+
+    case WM_SIZE:
+        {
+        /* Only a width change asks for a re-wrap.  The height moves
+           because this file's own growth code moved it -- relaying out
+           then would be the layout answering its own knock. */
+        RECTL r;
+        WinQueryWindowRect( hwnd, &r );
+        if( ( r.xRight - r.xLeft ) != gPWidth || gLLines == 0 )
+            pmPromptLayout_();
+        else
+            WinInvalidateRect( hwnd, NULL, False );
+        return 0;
+        }
+
+    case kWmButton1Down:
+        {
+        RECTL r;
+        WinQueryWindowRect( hwnd, &r );
+        LONG line = gPTop
+            + ( ( r.yTop - SHORT2FROMMP( mp2 ) ) - kPromptPadPx )
+              / ( gMleLineH > 0 ? gMleLineH : 16 );
+        if( line < gPTop )
+            line = gPTop;
+        if( line >= gLLines )
+            line = gLLines - 1;
+        const LONG ls = gLStart[ line ], ll = gLLen[ line ];
+        const LONG tx = SHORT1FROMMP( mp1 ) - kPromptPadPx;
+        LONG c = 0;
+        if( ll > 0 )
+            {
+            const HPS hps = WinGetPS( hwnd );
+            if( hps != 0 )
+                {
+                while( c < ll )
                     {
-                    n = kEntryMaxChars;
-                    if( gLog != 0 )
-                        fprintf( gLog, "entry submit: truncated\n" ),
-                            fflush( gLog );
+                    const LONG xw = (LONG) GpiQueryTabbedTextExtent(
+                        hps, (LONG) ( c + 1 ), (PCH) ( gPText + ls ),
+                        0, NULL );
+                    if( xw > tx )
+                        break;
+                    ++c;
                     }
-                ULONG off = 0;
-                ULONG cb = (ULONG) n;
-                WinSendMsg( hwnd, MLM_SETIMPORTEXPORT, MPFROMP( text ),
-                            MPFROMLONG( (LONG) sizeof( text ) - 1 ) );
-                WinSendMsg( hwnd, MLM_EXPORT, MPFROMP( &off ),
-                            MPFROMLONG( &cb ) );
-                if( cb > (ULONG) sizeof( text ) - 1 )
-                    cb = (ULONG) sizeof( text ) - 1;
-                LONG w = 0;
-                for( ULONG i2 = 0; i2 < cb; ++i2 )
-                    {
-                    if( text[ i2 ] == '\r' )
-                        {
-                        if( i2 + 1 < cb && text[ i2 + 1 ] == '\n' )
-                            continue;
-                        text[ w++ ] = '\n';
-                        }
-                    else
-                        text[ w++ ] = text[ i2 ];
-                    }
-                cb = (ULONG) w;
-                text[ cb ] = '\0';
-                if( gLog != 0 )
-                    fprintf( gLog, "entry submit len=%lu\n",
-                             (unsigned long) cb ), fflush( gLog );
-                WinSendMsg( hwnd, MLM_DELETE, MPFROMLONG( 0 ),
-                            MPFROMLONG( 65536 ) );
-                gPromptLen = -1;    // demand a recount on the next beat
-                pmPromptPoll();     // ...and shrink the box now, not later
-                if( cb > 0 )
-                    pmPromptSubmit( text );
-                return 0;
-                }
-            if( scan == 0x49 || scan == 0x51 )
-                {
-                pmTranscriptPage( scan == 0x49 ? -1 : 1 );
-                return 0;
-                }
-            if( ( flags & kKcCtrl ) != 0 && ch == 0x14 )
-                {
-                pmToggleThinking();
-                return 0;
+                WinReleasePS( hps );
                 }
             }
+        pmPromptMove_( ls + c, False );
+        return 0;
         }
-    else if( msg == WM_SETFOCUS && !gEntryFocusLogged )
+
+    case WM_PAINT:
         {
-        gEntryFocusLogged = True;
-        if( gLog != 0 )
-            fprintf( gLog, "focus entry hwnd=%p\n", hwnd ), fflush( gLog );
+        HPS hps = WinBeginPaint( hwnd, 0, NULL );
+        RECTL r;
+        WinQueryWindowRect( hwnd, &r );
+        const LONG cBack  = WinQuerySysColor( HWND_DESKTOP,
+                                              SYSCLR_ENTRYFIELD, 0 );
+        const LONG cText  = WinQuerySysColor( HWND_DESKTOP,
+                                              SYSCLR_WINDOWTEXT, 0 );
+        const LONG cFrame = WinQuerySysColor( HWND_DESKTOP,
+                                              SYSCLR_WINDOWFRAME, 0 );
+        WinFillRect( hps, &r, cBack );
+        RECTL b;
+        b = r; b.yTop = b.yBottom + 1;   WinFillRect( hps, &b, cFrame );
+        b = r; b.yBottom = b.yTop - 1;   WinFillRect( hps, &b, cFrame );
+        b = r; b.xRight = b.xLeft + 1;   WinFillRect( hps, &b, cFrame );
+        b = r; b.xLeft = b.xRight - 1;   WinFillRect( hps, &b, cFrame );
+
+        const LONG lineH   = gMleLineH > 0 ? gMleLineH : 16;
+        const LONG descent = gMleDesc;
+        LONG selA, selB;
+        pmPromptSel_( &selA, &selB );
+        GpiSetColor( hps, cText );
+        for( LONG i = gPTop; i < gLLines; ++i )
+            {
+            const LONG yTopLine = ( r.yTop - kPromptPadPx )
+                                  - ( i - gPTop ) * lineH;
+            const LONG ls = gLStart[ i ], ll = gLLen[ i ];
+            const LONG segA = ( selA > ls ) ? selA : ls;
+            const LONG segB = ( selB < ls + ll ) ? selB : ls + ll;
+            if( segB > segA )       // the selection band goes down first
+                {
+                RECTL sr;
+                sr.xLeft = kPromptPadPx + (LONG) GpiQueryTabbedTextExtent(
+                    hps, (LONG) ( segA - ls ), (PCH) ( gPText + ls ),
+                    0, NULL );
+                sr.xRight = kPromptPadPx + (LONG) GpiQueryTabbedTextExtent(
+                    hps, (LONG) ( segB - ls ), (PCH) ( gPText + ls ),
+                    0, NULL );
+                sr.xRight += 1;
+                sr.yBottom = yTopLine - lineH;
+                sr.yTop = yTopLine;
+                WinFillRect( hps, &sr, cFrame );
+                }
+            POINTL pt;
+            pt.y = yTopLine - lineH + descent;
+            if( ll > 0 )
+                {
+                pt.x = kPromptPadPx;
+                if( segA > ls )
+                    GpiCharStringAt( hps, &pt, (LONG) ( segA - ls ),
+                                     (PCH) ( gPText + ls ) );
+                if( segB > segA )   // over the band: text in the field's
+                    {               // own color, the band's color gone
+                    pt.x = kPromptPadPx
+                           + (LONG) GpiQueryTabbedTextExtent(
+                        hps, (LONG) ( segA - ls ), (PCH) ( gPText + ls ),
+                        0, NULL );
+                    GpiSetColor( hps, cBack );
+                    GpiCharStringAt( hps, &pt, (LONG) ( segB - segA ),
+                                     (PCH) ( gPText + segA ) );
+                    GpiSetColor( hps, cText );
+                    }
+                if( segB < ls + ll )
+                    {
+                    pt.x = kPromptPadPx
+                           + (LONG) GpiQueryTabbedTextExtent(
+                        hps, (LONG) ( segB - ls ), (PCH) ( gPText + ls ),
+                        0, NULL );
+                    GpiCharStringAt( hps, &pt, (LONG) ( ls + ll - segB ),
+                                     (PCH) ( gPText + segB ) );
+                    }
+                }
+            }
+        /* The caret belongs to the focused prompt only -- and focus in
+           PM hangs from the parent, so the question goes to the group:
+           of its children, is this the one holding the keyboard? */
+        if( gGroup != 0 && WinQueryFocus( gGroup ) == hwnd )
+            {
+            const LONG cl = pmPromptLineOf_( gPCaret );
+            if( cl >= gPTop )
+                {
+                const LONG yTopLine = ( r.yTop - kPromptPadPx )
+                                      - ( cl - gPTop ) * lineH;
+                if( yTopLine > r.yBottom && yTopLine - lineH < r.yTop )
+                    {
+                    RECTL cr;
+                    cr.xLeft = kPromptPadPx
+                               + (LONG) GpiQueryTabbedTextExtent(
+                        hps, (LONG) ( gPCaret - gLStart[ cl ] ),
+                        (PCH) ( gPText + gLStart[ cl ] ), 0, NULL );
+                    cr.xRight = cr.xLeft + 2;
+                    cr.yBottom = yTopLine - lineH + 2;
+                    cr.yTop = yTopLine - 2;
+                    WinFillRect( hps, &cr, cText );
+                    }
+                }
+            }
+        WinEndPaint( hps );
+        return 0;
         }
-    return gOldEntryProc != 0 ? gOldEntryProc( hwnd, msg, mp1, mp2 )
-                              : WinDefWindowProc( hwnd, msg, mp1, mp2 );
+
+    case WM_ERASEBACKGROUND:
+        // WM_PAINT paints every pixel; same answer the group gives and
+        // eFTE gives for its self-painted windows (g_pm.cpp:2049).
+        return (MRESULT) FALSE;
+        }
+    return WinDefWindowProc( hwnd, msg, mp1, mp2 );
 }
 
 /* The frame's client: a group, and its entire procedure is tiling.  PM
@@ -1517,56 +1842,6 @@ static MRESULT EXPENTRY pmGroupProc( HWND hwnd, ULONG msg,
             pswp->cx = (LONG) cols * (LONG) gCellPxW + gSbW;
             pswp->cy = (LONG) rows * (LONG) gCellPxH + gEntryH + gStatusH;
             }
-        return 0;
-        }
-
-    /* The prompt's own voice.  WM_CONTROL carries both signals the
-       strip's growth listens for.  MLN_PIXVERTOVERFLOW -- and its
-       text-level cousin MLN_OVERFLOW -- arrive with mp2 pointing at the
-       overflow struct (the toolkit's MLEOVERFLOW, copied above, because
-       Watcom declares the notification codes but ships no header for
-       the payload): the control itself saying how many pixels its
-       wrapped text stands short, which needs no faith in any undocumented
-       count.  The sanity bound matters: if this PM's MLE carries the
-       struct somewhere else and mp2 is really the control's window
-       handle, the bound ignores the nonsense rather than laying out
-       with it.  MLN_CHANGE -- text or selection moved -- re-asks the
-       line count, the one signal that can shrink the strip again; here
-       mp2 is the ordinary control handle and the comparison holds. */
-    case WM_CONTROL:
-        {
-        const USHORT note = SHORT2FROMMP( mp1 );
-        if( note == MLN_PIXVERTOVERFLOW || note == MLN_OVERFLOW )
-            {
-            const ATUIMLEOVER *ov = (const ATUIMLEOVER *) PVOIDFROMMP( mp2 );
-            if( ov != 0 && ov->pixVertOver > 0 && ov->pixVertOver <= 512 )
-                {
-                RECTL r;
-                WinQueryWindowRect( hwnd, &r );
-                LONG maxH = ( r.yTop - r.yBottom ) - gStatusH
-                            - (LONG) kMinRows * (LONG) gCellPxH;
-                if( maxH < gEntryH1 )
-                    maxH = gEntryH1;
-                const LONG want = gEntryH + ov->pixVertOver;
-                if( want > gEntryH && want <= maxH )
-                    {
-                    gEntryH = want;
-                    static int sOverLogs = 0;
-                    if( sOverLogs < 8 && gLog != 0 )
-                        {
-                        ++sOverLogs;
-                        fprintf( gLog, "entry vover %ld h %ld\n",
-                                 (long) ov->pixVertOver, (long) gEntryH ),
-                            fflush( gLog );
-                        }
-                    WinSendMsg( hwnd, WM_SIZE, MPVOID, MPVOID );
-                    }
-                }
-            return 0;
-            }
-        if( gEntry != 0 && (HWND) PVOIDFROMMP( mp2 ) == gEntry
-            && note == MLN_CHANGE )
-            pmPromptPoll();
         return 0;
         }
 
@@ -2277,6 +2552,21 @@ static void pmOpenWindow()
         gHab = 0;
         return;
         }
+    // The prompt, third of the three: the driver's own editor class,
+    // buffer and layout and drawn caret and all.  CS_SIZEREDRAW so a
+    // tile change repaints it, CS_CLIPCHILDREN for want of grandchildren
+    // but harmless, and CS_HITTEST so the click that places the caret
+    // is delivered.
+    if( !WinRegisterClass( gHab, "AtuiPrompt", (PFNWP) pmPromptProc,
+                           CS_SIZEREDRAW | CS_HITTEST, 0 ) )
+        {
+        pmLogErr( "WinRegisterClass prompt" );
+        WinDestroyMsgQueue( gHmq );
+        WinTerminate( gHab );
+        gHmq = 0;
+        gHab = 0;
+        return;
+        }
 
     // The frame, asked for explicitly rather than as "standard minus a
     // couple of things".  FCF_STANDARD (0xCC3F) requests MENU *and*
@@ -2375,7 +2665,10 @@ static void pmOpenWindow()
         pmLogErr( "status create" );
     gEntry = pmCreateEntry();
     if( gEntry != 0 )
+        {
         gEntryH1 = gEntryH;   // the one-line baseline growth adds to
+        pmPromptLayout_();    // first layout: one line, and the caret's home
+        }
     else
         {
         pmLogErr( "entry create" );
@@ -2503,8 +2796,7 @@ static void pmCloseWindow()
         gSbar = 0;                    // into it ever again
         gGroup = 0;                   // group, page, entry, status: the
         gEntry = 0;                   // whole tree came down with the
-        gStatusBar = 0;               // frame and its old procedures are
-        gOldEntryProc = 0;            // meaningless now
+        gStatusBar = 0;               // frame; its procedures died with it
         }
     if( gHmq != 0 )
         {
@@ -2916,11 +3208,6 @@ void THardwareInfo::waitForEvents( int timeoutMs ) noexcept
     /* The thumb keeps pace with the transcript on this same beat;
        pmSyncScrollBar is quiet when nothing moved. */
     pmSyncScrollBar();
-
-    /* And the prompt strip keeps pace with its text on the same beat --
-       quiet when the length has not changed, which is every beat until
-       the user types. */
-    pmPromptPoll();
 
     /* The closed window asks the application to end, once; five seconds
        later the asking stops and the process does.  The flag is earned by
