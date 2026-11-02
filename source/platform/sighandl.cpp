@@ -119,6 +119,12 @@ static inline bool isCustomHandler(T &&handler)
         && (void *) handler != (void *) SIG_IGN;
 }
 
+template <class T>
+static inline bool isIgnoredHandler(T &&handler)
+{
+    return (void *) handler == (void *) SIG_IGN;
+}
+
 bool SignalHandler::invokeHandlerOrDefault( int signo, const struct sigaction &action,
                                             siginfo_t *info, void *context ) noexcept
 {
@@ -127,6 +133,12 @@ bool SignalHandler::invokeHandlerOrDefault( int signo, const struct sigaction &a
         action.sa_sigaction(signo, info, context);
     else if (!(action.sa_flags & SA_SIGINFO) && isCustomHandler(action.sa_handler))
         action.sa_handler(signo);
+    else if ( (action.sa_flags & SA_SIGINFO)
+                ? isIgnoredHandler(action.sa_sigaction)
+                : isIgnoredHandler(action.sa_handler) )
+        // The action installed before ours was SIG_IGN: honor it instead of
+        // re-raising the signal, which would kill the process.
+        return false;
     else
         // Run default handler by re-raising the signal.
         return invokeDefault(signo, info);
