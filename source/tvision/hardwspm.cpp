@@ -319,23 +319,30 @@ static int    gKeysOnPage   = 0;   // the kit's keysToPage counter
 static Boolean gEntryFocusLogged = False;
 
 /* The prompt is a WC_MLE: the single line of a WC_ENTRYFIELD fits neither
-   of the two things asked of it -- word wrap, and a box that grows as the
-   message gains lines (measured against the entry field: it also carried
-   PM's default 32-character ceiling).  Everything MLE here speaks comes
-   from Watcom's own headers (MLM_*, MLS_*, MLN_*, WC_MLE all present) and
-   from the toolkit's controls sample (create/import/export patterns,
-   sty_dlg.c:1705, sty_file.c:475).  The MLEOVERFLOW shape is the toolkit
-   pmmle.h's, copied because Watcom ships no header for it.
+   of the two things asked of it -- word wrap, hard newlines on Shift+
+   Enter, and a box that grows as the message gains lines (measured
+   against the entry field: it also carried PM's default 32-character
+   ceiling).  Everything MLE here speaks comes from Watcom's own headers
+   (MLM_*, MLS_*, MLN_*, WC_MLE all present), from the toolkit's
+   controls sample (create/import/export, sty_dlg.c:1705,
+   sty_file.c:475) and from mcispy.c (MLM_DELETE's clear range, :227).
+   The MLEOVERFLOW shape is the toolkit pmmle.h's, copied because
+   Watcom ships no header for it.
      gEntryH1     one line's worth of strip, the birth formula's value;
      gMleLineH    px per extra wrapped line, measured from the control's
                   own font (GpiQueryFontMetrics on WinGetPS -- the window
                   DC carries the window's font), lMaxBaselineExt;
-     gEntryLines  the wrapped-line count the growth logic last believed.
+     gPromptLen   the text length seen last beat; -1 demands a recount.
+   Notifications are not the engine: the box sent not one MLN_CHANGE in
+   a session of typing (measured, atuipm.run.txt), so growth rides the
+   wait loop's beat -- pmPromptPoll -- and the notification handler
+   below only makes an already-arrived signal act at once.
    Text ceiling: PM's entry-field default is 32; the MLE is memory-bound,
    so the limit is one we state: kEntryMaxChars via MLM_SETTEXTLIMIT. */
 static LONG   gEntryH1      = 0;
 static LONG   gMleLineH     = 0;
-static LONG   gEntryLines   = 1;
+static LONG   gPromptLen    = -1;
+static LONG   gPromptW      = 0;
 static const LONG kEntryMaxChars = 4096;
 
 typedef struct _ATUIMLEOVER    /* the toolkit's MLEOVERFLOW (pmmle.h) */
@@ -1163,9 +1170,10 @@ static void pmSnapSWP( HWND hwndFrame, PSWP pswp )
    every one it does: the arrows, Home/End, selection, the clipboard, its
    own Ctrl-Z undo -- all PM's, none of this driver's business.
 
-   Enter submits and stops there: the MLE would insert a newline, the
-   message is one logical line.  The read is the toolkit's proven export
-   pattern, the reset re-makes the control (see pmEntryReset).  PgUp/
+   Enter submits and stops there; Shift+Enter is deliberately not caught,
+   and the MLE inserts its hard newline -- a message may be many
+   paragraphs.  The read is the toolkit's proven export pattern, the
+   clear mcispy's MLM_DELETE range.  PgUp/
    PgDn belong to the transcript, found by scan code (0x49/0x51), the
    same identifiers that made the injected pages land.  Ctrl-T toggles
    the thinking blocks.  Alt chords are forwarded to the application:
@@ -1174,8 +1182,7 @@ static void pmSnapSWP( HWND hwndFrame, PSWP pswp )
 static MRESULT EXPENTRY pmEntryProc( HWND hwnd, ULONG msg,
                                      MPARAM mp1, MPARAM mp2 );
 
-/* Make the prompt.  One function because two moments need it: birth, and
-   every submit (see pmEntryReset).  Everything it says to the MLE is
+/* Make the prompt.  Everything it says to the MLE is
    Watcom-declared and toolkit-patterned; the text limit's return value
    -- how many characters actually fit -- goes to the log, so if the
    control ever refuses the arrangement the box says so on the first
@@ -1218,69 +1225,103 @@ static HWND pmCreateEntry( void )
     return h;
 }
 
-/* Empty the prompt after a submit.  The toolkit sample surface offers no
-   proven clear message -- import inserts, export reads -- so the control
-   is returned to its birth state the one way that needs no faith: the
-   window made for this moment is unmade and re-made.  That re-applies
-   the text limit and the subclass with the same calls that just worked,
-   and a submit happens once per message, not once per keystroke. */
-static void pmEntryReset( void )
+/* The wrapped-line count of the prompt's text, computed locally: the
+   arithmetic is the driver's own, run against the control's text and
+   the control's own font.  MLM_QUERYLINECOUNT's argument form the
+   mirrors never show, and the notifications never came -- so the text
+   is exported with proven calls, split at hard newlines (Shift+Enter
+   and pasted blocks), and each hard line is greedy-wrapped against the
+   box's width minus a generous gutter, word by word, measured with
+   GpiQueryTabbedTextExtent on the window's PS.  Miscounts err tall --
+   an MLE taller than its text is invisible; one shorter hides the
+   caret, which is not.  Text longer than a line splits mid-word as the
+   MLE itself would split it. */
+static LONG pmPromptLines_( const char *text, LONG len, LONG width )
 {
-    if( gEntry == 0 )
-        return;
-    const Boolean wasFocused = ( WinQueryFocus( gFrame ) == gEntry );
-    WinDestroyWindow( gEntry );
-    gEntry = pmCreateEntry();
-    gEntryLines = 1;
-    if( gEntry != 0 && wasFocused && gKeysOnPage == 0 )
-        WinSetFocus( gGroup, gEntry );
-    if( gGroup != 0 )
-        WinSendMsg( gGroup, WM_SIZE, MPVOID, MPVOID );
+    if( len <= 0 )
+        return 1;
+    LONG avail = width - 16;   // MLS_BORDER and the MLE's margins, over-counted
+    if( avail < 48 )
+        avail = 48;
+    const HPS hps = WinGetPS( gEntry );
+    if( hps == 0 )
+        return 1;              // cannot measure: move nothing
+    const LONG spw = (LONG) GpiQueryTabbedTextExtent( hps, 1, (PCH) " ",
+                                                      0, NULL );
+    LONG total = 0;
+    LONG a = 0;
+    for( ;; )
+        {
+        LONG b = a;
+        while( b < len && text[b] != '\n' )
+            ++b;
+        LONG count = 1, x = 0, pending = 0;
+        LONG j = a;
+        while( j < b )
+            {
+            if( text[j] == ' ' )
+                { ++pending; ++j; continue; }
+            LONG k = j;
+            while( k < b && text[k] != ' ' )
+                ++k;
+            const LONG ww = (LONG) GpiQueryTabbedTextExtent(
+                hps, (LONG) ( k - j ), (PCH) ( text + j ), 0, NULL );
+            LONG need = ww + ( x > 0 ? pending * spw : 0 );
+            if( x > 0 && x + need > avail )
+                { ++count; x = 0; need = ww; }   // the break eats its spaces
+            while( x + need > avail )
+                { ++count; x = 0; need -= avail; }
+            x += need;
+            pending = 0;
+            j = k;
+            }
+        total += count;
+        if( b >= len )
+            break;
+        a = b + 1;
+        }
+    WinReleasePS( hps );
+    return total > 0 ? total : 1;
 }
 
-/* The strip the prompt wants, from the wrapped-line count the control
-   reports.  MLM_QUERYLINECOUNT's argument form is the one thing the
-   mirrors do not spell out (no sample uses it), so the answer is
-   believed only when it is sane: 1..512.  Anything else freezes the
-   strip at what it is and says so once -- a prompt that stopped growing
-   is a prompt still working; a driver acting on a garbage count is not.
-   The other signal -- the MLE's own vertical-overflow notification, in
-   pixels, struct and all in our headers -- grows the strip regardless,
-   so a silent line-count costs only the shrinking. */
-static void pmEntryNotice( void )
+/* The strip the prompt wants, driven from the wait loop's beat next to
+   pmSyncScrollBar's.  MLM_QUERYTEXTLENGTH is proven and cheap, so a
+   beat with nothing new costs one message and two compares; exporting
+   and counting happen only when the length -- or the box's width --
+   changed. */
+static void pmPromptPoll( void )
 {
     if( gEntry == 0 || gMleLineH <= 0 || gGroup == 0 )
         return;
-    /* One forensic line before the first query: if the control's answer
-       ever kills the session -- it is the one MLE call the mirrors show
-       no sample making -- the log's last word names it, and the fix is
-       deleting the call, the overflow notifications growing the strip
-       alone. */
-    static Boolean sQueried = False;
-    if( !sQueried && gLog != 0 )
-        {
-        sQueried = True;
-        fprintf( gLog, "entry linecount try\n" ), fflush( gLog );
-        }
-    const LONG lines = (LONG) WinSendMsg( gEntry, MLM_QUERYLINECOUNT,
-                                          MPVOID, MPVOID );
-    if( lines < 1 || lines > 512 )
-        {
-        static Boolean sRefused = False;
-        if( !sRefused && gLog != 0 )
-            {
-            sRefused = True;
-            fprintf( gLog, "entry linecount refused rc=%ld\n", (long) lines ),
-                fflush( gLog );
-            }
+    const LONG len = (LONG) WinSendMsg( gEntry, MLM_QUERYTEXTLENGTH,
+                                        MPVOID, MPVOID );
+    RECTL er;
+    WinQueryWindowRect( gEntry, &er );
+    const LONG width = er.xRight - er.xLeft;
+    if( len == gPromptLen && width == gPromptW )
         return;
+    gPromptLen = len;
+    gPromptW = width;
+    LONG lines = 1;
+    LONG n = len;
+    if( n < 0 )
+        n = 0;
+    if( n > kEntryMaxChars )
+        n = kEntryMaxChars;
+    if( n > 0 )
+        {
+        static char text[ kEntryMaxChars + 2 ];
+        ULONG off = 0;
+        ULONG cb = (ULONG) n;
+        WinSendMsg( gEntry, MLM_SETIMPORTEXPORT, MPFROMP( text ),
+                    MPFROMLONG( (LONG) sizeof( text ) - 1 ) );
+        WinSendMsg( gEntry, MLM_EXPORT, MPFROMP( &off ), MPFROMLONG( &cb ) );
+        if( cb > (ULONG) sizeof( text ) - 1 )
+            cb = (ULONG) sizeof( text ) - 1;
+        lines = pmPromptLines_( text, (LONG) cb, width );
         }
-    if( lines == gEntryLines )
-        return;
-    gEntryLines = lines;
-
-    /* Never take the page below its minimum: the strip's growth clamps
-       there and the MLE scrolls its own overflow from then on. */
+    /* Never take the page below its minimum: the strip clamps there and
+       the MLE scrolls its own overflow from then on. */
     RECTL r;
     WinQueryWindowRect( gGroup, &r );
     LONG maxH = ( r.yTop - r.yBottom ) - gStatusH
@@ -1296,11 +1337,11 @@ static void pmEntryNotice( void )
         return;
     gEntryH = want;
     static int sGrowLogs = 0;
-    if( sGrowLogs < 12 && gLog != 0 )
+    if( sGrowLogs < 16 && gLog != 0 )
         {
         ++sGrowLogs;
-        fprintf( gLog, "entry lines %ld h %ld\n", (long) lines,
-                 (long) gEntryH ), fflush( gLog );
+        fprintf( gLog, "entry grow len %ld lines %ld h %ld\n",
+                 (long) len, (long) lines, (long) gEntryH ), fflush( gLog );
         }
     WinSendMsg( gGroup, WM_SIZE, MPVOID, MPVOID );
 }
@@ -1327,15 +1368,18 @@ static MRESULT EXPENTRY pmEntryProc( HWND hwnd, ULONG msg,
                 pmTakeChar( flags, ch, (ushort) SHORT2FROMMP( mp2 ), scan );
                 return 0;
                 }
-            if( ch == 0x0D )
+            if( ch == 0x0D && ( ( flags & kKcShift ) == 0 ) )
                 {
-                /* Enter submits.  The MLE would insert a newline, so
-                   the character stops here; the message is one logical
-                   line whatever the user pasted into it (export hands
-                   CR/LF back from wrapped and pasted text both, and
-                   both become spaces).  The read is the toolkit's
-                   proven export pattern, and the reset re-makes the
-                   control rather than trust an unproven clear. */
+                /* Enter submits.  Shift+Enter is the exception the user
+                   asked for: it is not intercepted, and the MLE inserts
+                   a hard newline of its own -- the message can be many
+                   lines.  The read is the toolkit's proven export
+                   pattern; CR/LF arrive from wrapped and hard breaks
+                   alike, so they normalize to bare LF on the way out
+                   (the model sees the paragraphs the user typed).  The
+                   clear is mcispy's call -- MLM_DELETE from 0 to 65536
+                   (mcispy.c:227) -- which leaves focus and caret where
+                   they are, unlike re-creating the window. */
                 static char text[ kEntryMaxChars + 2 ];
                 LONG n = (LONG) WinSendMsg( hwnd, MLM_QUERYTEXTLENGTH,
                                             MPVOID, MPVOID );
@@ -1356,14 +1400,27 @@ static MRESULT EXPENTRY pmEntryProc( HWND hwnd, ULONG msg,
                             MPFROMLONG( &cb ) );
                 if( cb > (ULONG) sizeof( text ) - 1 )
                     cb = (ULONG) sizeof( text ) - 1;
+                LONG w = 0;
+                for( ULONG i2 = 0; i2 < cb; ++i2 )
+                    {
+                    if( text[ i2 ] == '\r' )
+                        {
+                        if( i2 + 1 < cb && text[ i2 + 1 ] == '\n' )
+                            continue;
+                        text[ w++ ] = '\n';
+                        }
+                    else
+                        text[ w++ ] = text[ i2 ];
+                    }
+                cb = (ULONG) w;
                 text[ cb ] = '\0';
-                for( ULONG i = 0; i < cb; ++i )
-                    if( text[ i ] == '\r' || text[ i ] == '\n' )
-                        text[ i ] = ' ';
                 if( gLog != 0 )
-                    fprintf( gLog, "entry submit len=%lu\n", (unsigned long) cb ),
-                        fflush( gLog );
-                pmEntryReset();
+                    fprintf( gLog, "entry submit len=%lu\n",
+                             (unsigned long) cb ), fflush( gLog );
+                WinSendMsg( hwnd, MLM_DELETE, MPFROMLONG( 0 ),
+                            MPFROMLONG( 65536 ) );
+                gPromptLen = -1;    // demand a recount on the next beat
+                pmPromptPoll();     // ...and shrink the box now, not later
                 if( cb > 0 )
                     pmPromptSubmit( text );
                 return 0;
@@ -1509,7 +1566,7 @@ static MRESULT EXPENTRY pmGroupProc( HWND hwnd, ULONG msg,
             }
         if( gEntry != 0 && (HWND) PVOIDFROMMP( mp2 ) == gEntry
             && note == MLN_CHANGE )
-            pmEntryNotice();
+            pmPromptPoll();
         return 0;
         }
 
@@ -2859,6 +2916,11 @@ void THardwareInfo::waitForEvents( int timeoutMs ) noexcept
     /* The thumb keeps pace with the transcript on this same beat;
        pmSyncScrollBar is quiet when nothing moved. */
     pmSyncScrollBar();
+
+    /* And the prompt strip keeps pace with its text on the same beat --
+       quiet when the length has not changed, which is every beat until
+       the user types. */
+    pmPromptPoll();
 
     /* The closed window asks the application to end, once; five seconds
        later the asking stops and the process does.  The flag is earned by
