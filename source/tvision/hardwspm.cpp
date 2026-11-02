@@ -1173,6 +1173,36 @@ static void pmSnapSWP( HWND hwndFrame, PSWP pswp )
     pswp->cy = newCy;
 }
 
+/* The MLE's documented creation data (the EDM/2 WinCreateWindow
+   reference names MLECTLDATA for the class; IBM's own shape is
+   pmmle.h:70).  Two things it does that no after-the-fact message
+   replicated: the text limit arrives before the window exists, and
+   MLFFMTRECT_MATCHWINDOW ties the formatting rectangle to the
+   window -- the wrap follows every tile of the strip.  The struct is
+   transcribed from the toolkit and NOT taken from Watcom's header:
+   Watcom typedefs IPT as a bare LONG (pmwin.h:1870) where IBM's IPT
+   is a pair of longs, and passing the 4 bytes-per-point shape to a
+   control that parses 8 would scatter the fields.  The two zero
+   format dimensions are the "derive it yourself" convention that
+   MATCHWINDOW implies: the MLE takes the size from its window. */
+typedef struct
+    {
+    LONG lLine;
+    LONG lColumn;
+    } AtuiIpt;
+typedef struct
+    {
+    USHORT cbCtlData;
+    USHORT afIEFormat;
+    ULONG  cchText;
+    AtuiIpt iptAnchor;
+    AtuiIpt iptCursor;
+    LONG   cxFormat;
+    LONG   cyFormat;
+    ULONG  afFormatFlags;
+    PVOID  pHWXCtlData;
+    } AtuiMleCtlData;
+
 /* Make the prompt: the box's own multiline textbox, word wrap on at
    birth the way the toolkit creates one (sty_dlg.c:1703 --
    WS_VISIBLE|MLS_WORDWRAP), and read the same way (the export pair,
@@ -1184,11 +1214,23 @@ static void pmSnapSWP( HWND hwndFrame, PSWP pswp )
    fact worth having before the user trusts the box with a message. */
 static HWND pmCreateEntry( void )
 {
+    AtuiMleCtlData cd;
+    cd.cbCtlData = (USHORT) sizeof( cd );
+    cd.afIEFormat = MLFIE_CFTEXT;         // plain text; CR/LF newlines
+    cd.cchText = (ULONG) kEntryMaxChars;  // the 4k, from the first byte
+    cd.iptAnchor.lLine = 0;
+    cd.iptAnchor.lColumn = 0;
+    cd.iptCursor.lLine = 0;
+    cd.iptCursor.lColumn = 0;
+    cd.cxFormat = 0;                      // MATCHWINDOW: follow the window
+    cd.cyFormat = 0;
+    cd.afFormatFlags = MLFFMTRECT_MATCHWINDOW;
+    cd.pHWXCtlData = 0;
     const HWND h = WinCreateWindow( gGroup, WC_MLE, "",
                                     WS_VISIBLE | WS_TABSTOP | MLS_WORDWRAP
                                       | MLS_BORDER,
                                     0, 0, 0, 0, gGroup, HWND_TOP,
-                                    0, NULL, NULL );
+                                    0, &cd, NULL );
     if( h == 0 )
         return 0;
     const LONG fit = (LONG) WinSendMsg( h, MLM_SETTEXTLIMIT,
@@ -2318,6 +2360,14 @@ static void pmOpenWindow()
 
     if( gLog == 0 )
         gLog = fopen( "atuipm.run.txt", "w" );
+    /* The stamp before the birth: which compilation the box is
+       running.  A round was spent on a session whose log belonged to
+       an older binary -- the build chain had relinked a stale object
+       -- and nothing in the log could tell the two builds apart.
+       __DATE__ and __TIME__ are the compiler's own record of the
+       translation, and they cost one line. */
+    if( gLog != 0 )
+        fprintf( gLog, "stamp %s %s\n", __DATE__, __TIME__ ), fflush( gLog );
     pmLog( "birth" );
 
     gHab = WinInitialize( 0 );
