@@ -232,7 +232,14 @@ static int pmSwitchModelDialog( void )
 
 /* settings, providers, undo: the fields exist so the kit's shape is final;
    null means the tvision dialog still wears that one.  They arrive as their
-   own measured steps, the way everything else here did. */
+   own measured steps, the way everything else here did.
+
+   The last two fields are the chrome, defined with the windows they drive
+   in hardwspm.cpp -- status hands the native status button its text,
+   keysToPage is the keyboard's traffic light for tvision modals. */
+extern "C" void pmStatusKit( const char *text );
+extern "C" void pmKeysToPageKit( int on );
+
 static const PmDialogs kPmDialogs =
     {
     pmAboutDialog,
@@ -240,7 +247,9 @@ static const PmDialogs kPmDialogs =
     pmSwitchModelDialog,
     0,
     0,
-    0
+    0,
+    pmStatusKit,
+    pmKeysToPageKit
     };
 
 void pmDialogsInstall( void )

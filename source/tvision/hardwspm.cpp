@@ -298,14 +298,41 @@ static HWND   gSbar      = 0;
 static LONG   gSbW       = 0;   // pixels the bar takes (SV_CXVSCROLL)
 static int    gVsbLogs   = 0;   // the bar's first twelve WM_VSCROLLs
 
+/* The chrome.  The frame's client is a plain group window -- PM's own
+   shape for "an area with children" -- and it tiles three: the page at
+   the top (that is gClient, and everything this driver ever wrote about
+   gClient still holds, because the page's rect is what the cell
+   arithmetic reads), the entry field above the status line, and the
+   status line along the bottom.  Children, not neighbours: the page's
+   VioShowBuf paints its window and nothing beyond it, so nothing can
+   ever wipe a control again, and no control paints over the page.  The
+   heights are the SV_CYMENU row and its borders, queried -- the toolkit
+   sample sizes an entry field by hand (teldir.c writes 18), and the
+   system's own menu row is the measured version of the same number. */
+static HWND   gGroup        = 0;
+static HWND   gEntry        = 0;
+static PFNWP  gOldEntryProc = 0;
+static HWND   gStatusBar    = 0;
+static LONG   gEntryH       = 0;
+static LONG   gStatusH      = 0;
+static int    gKeysOnPage   = 0;   // the kit's keysToPage counter
+static Boolean gEntryFocusLogged = False;
+
 /* The transcript is app knowledge; the bar is the driver's.  app.cpp
    (src/tui) implements the first two -- extent of the line list, and a
    jump when the thumb moves -- and calls the driver's pmSyncScrollBar
    from its relayout tick with the third.  A three-line conversation is
-   the whole of the seam. */
+   the whole of the seam.  The entry field's three asks go the same way:
+   the Enter key submits, PgUp/PgDn belong to the transcript, Ctrl-T
+   toggles thinking -- all of it app decisions the control itself must
+   not try to know (declared once for both trees in src/tui/pmdialogs.h,
+   named again here the way the transcript pair has always been). */
 extern "C" {
 void pmTranscriptExtent( int *total, int *view, int *pos );
 void pmTranscriptJump( int line );
+void pmPromptSubmit( const char *text );
+void pmTranscriptPage( int direction );
+void pmToggleThinking( void );
 }
 static Boolean gAvioOk   = False;
 static Boolean gPmUp    = False; // window + queue exist; drawing is legal
@@ -403,9 +430,13 @@ static int gFocusOut = 0;                 // counted a dozen times each: a
                                           // and the once-only log could not
                                           // tell theft from gossip
 static Boolean gMouseLogged = False;      // at all, each logged once
-static Boolean gAdjustLogged = False;     // the snap request: once, to
-                                          // vouch for its number
-static Boolean gFrameAdjustLogged = False;    // ... at either window
+                                          // (the client's adjust request is
+                                          // answered by the group procedure
+                                          // now, so it no longer gets a log
+                                          // of its own)
+static Boolean gFrameAdjustLogged = False;    // the snap request: once, to
+                                          // vouch for its number ... at the
+                                          // frame
 static int gUnknownMsgs = 0;              // the capture net: forty at most
 static int gWheelLogs = 0;                // the wheel: its first few raw
                                           // messages, then silence
@@ -879,11 +910,22 @@ HWND pmFrameWindow( void )
    WinDlgBox's own -- and rebuilding the screen under an open dialog is
    not something to try on a machine someone is watching.  So resizes
    that arrive mid-dialog wait for the count to fall back to zero. */
+/* Forward: defined with the kit entries further down this file. */
+extern "C" void pmGiveEntryFocus( void );
+
 void pmNoteDialog( int delta )
 {
     gDialogs += delta;
     if( gDialogs < 0 )
         gDialogs = 0;
+    // The last native modal closed: the entry field is the keyboard's
+    // owner again.  PM restores focus over a modal dialog by itself, and
+    // usually right -- this is the belt for the paths where "usually"
+    // slips (a dialog dismissed from the menu while something else held
+    // focus).  pmGiveEntryFocus declines while a tvision dialog counts,
+    // so it can never steal keys from a modal that is still running.
+    if( gDialogs == 0 )
+        pmGiveEntryFocus();
 }
 
 static void pmTakeCommand( int id )
@@ -1063,11 +1105,12 @@ static void pmSnapSWP( HWND hwndFrame, PSWP pswp )
     WinCalcFrameRect( hwndFrame, &r0, TRUE );
     LONG cw = r0.xRight - r0.xLeft;
     LONG ch = r0.yTop - r0.yBottom;
-    /* The bar's column is pixels the grid never sees -- the same
-       deduction WM_SIZE makes, so the two windows agree on what the
-       client's cells are. */
+    /* The bar's column and the entry + status strips are pixels the grid
+       never sees -- the same deductions WM_SIZE and the group's tiling
+       make, so the windows and the snap agree on what the client's cells
+       are. */
     ushort cols = (ushort) ((cw - gSbW) / (LONG) gCellPxW);
-    ushort rows = (ushort) ( ch / (LONG) gCellPxH );
+    ushort rows = (ushort) ((ch - gEntryH - gStatusH) / (LONG) gCellPxH);
     if( cols < kMinCols )
         cols = kMinCols;
     if( rows < kMinRows )
@@ -1077,7 +1120,7 @@ static void pmSnapSWP( HWND hwndFrame, PSWP pswp )
     r1.xLeft = 0;
     r1.yBottom = 0;
     r1.xRight = (LONG) cols * (LONG) gCellPxW + gSbW;
-    r1.yTop = (LONG) rows * (LONG) gCellPxH;
+    r1.yTop = (LONG) rows * (LONG) gCellPxH + gEntryH + gStatusH;
     WinCalcFrameRect( hwndFrame, &r1, FALSE );
     LONG newCx = r1.xRight - r1.xLeft;
     LONG newCy = r1.yTop - r1.yBottom;
@@ -1085,6 +1128,138 @@ static void pmSnapSWP( HWND hwndFrame, PSWP pswp )
                                   // window resized keeps its top edge
     pswp->cx = newCx;
     pswp->cy = newCy;
+}
+
+/* The entry field's own procedure -- the driver answers for the few keys
+   the control cannot know the meaning of, and lets the entry field be an
+   entry field for every one it does: the arrows, Home/End, selection, the
+   clipboard, all PM's, none of this driver's business.
+
+   Enter submits: the text is read, the field is cleared (the submit is
+   in flight the moment the Enter goes down, and a re-typed prompt should
+   not double-send what is already on its way), and pmPromptSubmit takes
+   it on the pump's own thread -- the same context the tvision prompt's
+   Enter always had.  PgUp/PgDn belong to the transcript, found by scan
+   code (0x49/0x51), the same identifiers that made the injected pages
+   land.  Ctrl-T toggles the thinking blocks.  Alt chords are the one
+   family deliberately absent: the menu owns them, and WinGetMsg answers
+   for the frame before the field ever sees the character. */
+static MRESULT EXPENTRY pmEntryProc( HWND hwnd, ULONG msg,
+                                     MPARAM mp1, MPARAM mp2 )
+{
+    if( msg == WM_CHAR )
+        {
+        const ULONG flags = SHORT1FROMMP( mp1 );
+        if( ( flags & kKcKeyUp ) == 0 )
+            {
+            const short ch = (short) SHORT1FROMMP( mp2 );
+            const uchar scan = (uchar) CHAR4FROMMP( mp1 );
+            if( ch == 0x0D )
+                {
+                char text[ 1024 ];
+                LONG n = WinQueryWindowText( hwnd, (ULONG) ( sizeof( text ) - 1 ),
+                                             text );
+                if( n < 0 )
+                    n = 0;
+                if( n > (LONG) sizeof( text ) - 1 )
+                    {
+                    n = (LONG) sizeof( text ) - 1;
+                    if( gLog != 0 )
+                        fprintf( gLog, "entry submit: truncated\n" ), fflush( gLog );
+                    }
+                text[n] = '\0';
+                WinSetWindowText( hwnd, (PSZ) "" );
+                if( gLog != 0 )
+                    fprintf( gLog, "entry submit len=%ld\n", (long) n ), fflush( gLog );
+                if( n > 0 )
+                    pmPromptSubmit( text );
+                return 0;
+                }
+            if( scan == 0x49 || scan == 0x51 )
+                {
+                pmTranscriptPage( scan == 0x49 ? -1 : 1 );
+                return 0;
+                }
+            if( ( flags & kKcCtrl ) != 0 && ch == 0x14 )
+                {
+                pmToggleThinking();
+                return 0;
+                }
+            }
+        }
+    else if( msg == WM_SETFOCUS && !gEntryFocusLogged )
+        {
+        gEntryFocusLogged = True;
+        if( gLog != 0 )
+            fprintf( gLog, "focus entry hwnd=%p\n", hwnd ), fflush( gLog );
+        }
+    return gOldEntryProc != 0 ? gOldEntryProc( hwnd, msg, mp1, mp2 )
+                              : WinDefWindowProc( hwnd, msg, mp1, mp2 );
+}
+
+/* The frame's client: a group, and its entire procedure is tiling.  PM
+   counts from the bottom left, so the stack from the floor up is status,
+   entry, page -- and the page's rect is exactly cols cells by rows cells
+   plus the bar's column, which is what its own WM_SIZE computes the
+   grid from.  WM_SIZE arrives after WM_ADJUSTWINDOWPOS answered with the
+   snapped size, so this tiling lands on the final numbers once per drag
+   step, and the grid rebuild happens once with it. */
+static MRESULT EXPENTRY pmGroupProc( HWND hwnd, ULONG msg,
+                                     MPARAM mp1, MPARAM mp2 )
+{
+    switch( msg )
+        {
+    case WM_SIZE:
+        {
+        RECTL r;
+        WinQueryWindowRect( hwnd, &r );
+        const LONG w = r.xRight - r.xLeft;
+        const LONG h = r.yTop - r.yBottom;
+        if( gStatusBar != 0 )
+            WinSetWindowPos( gStatusBar, 0, 0, 0, w, gStatusH,
+                             SWP_SIZE | SWP_MOVE | SWP_SHOW );
+        if( gEntry != 0 )
+            WinSetWindowPos( gEntry, 0, 0, gStatusH, w, gEntryH,
+                             SWP_SIZE | SWP_MOVE | SWP_SHOW );
+        const LONG pageH = h - gStatusH - gEntryH;
+        if( gClient != 0 && pageH > 0 )
+            WinSetWindowPos( gClient, 0, 0, gStatusH + gEntryH, w, pageH,
+                             SWP_SIZE | SWP_MOVE | SWP_SHOW );
+        return 0;
+        }
+
+    /* The same cell snap the frame gives its own size, answered in client
+       units this time: proposed pixels in, the cell boundary they belong
+       to out.  The frame's answer and this one run the same arithmetic on
+       the same numbers, which is what keeps the client's rect the page's
+       rect plus the strips exactly. */
+    case WM_ADJUSTWINDOWPOS:
+        {
+        PSWP pswp = (PSWP) PVOIDFROMMP( mp1 );
+        if( ( pswp->fl & SWP_SIZE ) != 0 )
+            {
+            ushort cols = (ushort) ( ((LONG) pswp->cx - gSbW)
+                                     / (LONG) gCellPxW );
+            ushort rows = (ushort) ( ((LONG) pswp->cy - gEntryH - gStatusH)
+                                     / (LONG) gCellPxH );
+            if( cols < kMinCols )
+                cols = kMinCols;
+            if( rows < kMinRows )
+                rows = kMinRows;
+            pswp->cx = (LONG) cols * (LONG) gCellPxW + gSbW;
+            pswp->cy = (LONG) rows * (LONG) gCellPxH + gEntryH + gStatusH;
+            }
+        return 0;
+        }
+
+    case WM_ERASEBACKGROUND:
+        // The three children cover the group with their own painting; the
+        // default erase would only flash gray behind a resize.
+        return (MRESULT) FALSE;
+
+    default:
+        return WinDefWindowProc( hwnd, msg, mp1, mp2 );
+        }
 }
 
 static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
@@ -1191,26 +1366,9 @@ static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
         }
         return 0;
 
-    /* The adjust request that answers with the cell snap belongs to the
-       frame -- see pmFrameProc.  Some documented PM configurations give
-       the client a turn at it too, so the door stays open here and
-       answers the one way; no log line, because this case has never run
-       on the box and a line is only worth its log when it can answer a
-       question. */
-    case WM_ADJUSTWINDOWPOS:
-        {
-        PSWP pswp = (PSWP) PVOIDFROMMP( mp1 );
-        if( !gAdjustLogged && gLog != 0 )
-            {
-            gAdjustLogged = True;
-            fprintf( gLog, "adjust at client cx=%ld cy=%ld fl=0x%lx\n",
-                     (long) pswp->cx, (long) pswp->cy,
-                     (unsigned long) pswp->fl );
-            fflush( gLog );
-            }
-        pmSnapSWP( gFrame, pswp );
-        return 0;
-        }
+    /* WM_ADJUSTWINDOWPOS belongs to the frame's client now -- the group's
+       procedure answers it.  The page is a child the group places by hand,
+       and a window of its own turn gets no say in where it goes. */
 
     case WM_SETFOCUS:
         gFocused = True;
@@ -1778,6 +1936,20 @@ static void pmOpenWindow()
         gHab = 0;
         return;
         }
+    // The frame's client: a group, tiler of page and chrome.  Two classes
+    // because two windows, and the page stays what it always was -- the
+    // window the page engine is associated with, the caret's, the keys'
+    // (while the entry field lets them through).
+    if( !WinRegisterClass( gHab, "AtuiGroup", (PFNWP) pmGroupProc,
+                           CS_SIZEREDRAW | CS_CLIPCHILDREN, 0 ) )
+        {
+        pmLogErr( "WinRegisterClass group" );
+        WinDestroyMsgQueue( gHmq );
+        WinTerminate( gHab );
+        gHmq = 0;
+        gHab = 0;
+        return;
+        }
 
     // The frame, asked for explicitly rather than as "standard minus a
     // couple of things".  FCF_STANDARD (0xCC3F) requests MENU *and*
@@ -1795,8 +1967,8 @@ static void pmOpenWindow()
     ULONG flFrame = (FCF_STANDARD & ~FCF_SHELLPOSITION & ~FCF_MAXBUTTON
                      & ~FCF_ACCELTABLE);
     gFrame = WinCreateStdWindow( HWND_DESKTOP, 0, &flFrame,
-                                 "AtuiApp", "atui",
-                                 0, (HMODULE) 0, kIdWindow, &gClient );
+                                 "AtuiGroup", "atui",
+                                 0, (HMODULE) 0, kIdWindow, &gGroup );
     if( gFrame == 0 )
         {
         pmLogErr( "WinCreateStdWindow" );
@@ -1817,15 +1989,89 @@ static void pmOpenWindow()
     if( gOldFrameProc == 0 )
         pmLogErr( "frame subclass" );
 
-    // The window makes the native dialogs possible: hand them to the
-    // application now (src/tui/pmdialogs.h), before the first paint and
-    // before any event that could open one.
+    // The window enables native dialogs: hand them to the application now
+    // (src/tui/pmdialogs.h), before the first paint and before any event
+    // that could open one.
     pmDialogsInstall();
+
+    /* The page -- a child of the group, and the window everything else
+       in this driver already believes gClient to be: the DC opens on it,
+       the page engine associates to it, the caret lives in it, keys that
+       the entry field does not want arrive at it.  Created with a zero
+       rect; the group's first WM_SIZE places it. */
+    gClient = WinCreateWindow( gGroup, "AtuiApp", "atui-page",
+                               WS_VISIBLE,
+                               0, 0, 0, 0, gGroup, HWND_TOP,
+                               0, NULL, NULL );
+    if( gClient == 0 )
+        {
+        pmLogErr( "page create" );
+        WinDestroyWindow( gFrame );
+        gFrame = 0;
+        gGroup = 0;
+        WinDestroyMsgQueue( gHmq );
+        WinTerminate( gHab );
+        gHmq = 0;
+        gHab = 0;
+        return;
+        }
+
+    /* The chrome's two strips.  Watcom's headers hold no SV_CYENTERFIELD,
+       and the toolkit sample that sizes an entry field by hand writes 18
+       pixels for the system font of the day (teldir.c); the system's own
+       menu row is the live measurement of the same thing, so the status
+       line takes that height and the entry field the menu row plus two
+       borders of room for its frame.  Both stand in the group's bottom
+       strip, the status on the floor and the entry above it -- and if a
+       creation fails the strip simply does not exist, the grid taking the
+       room back. */
+    gStatusH = (LONG) WinQuerySysValue( HWND_DESKTOP, SV_CYMENU );
+    if( gStatusH < 8 )
+        gStatusH = 18;
+    gEntryH = gStatusH + 2 * (LONG) WinQuerySysValue( HWND_DESKTOP,
+                                                      SV_CYBORDER ) + 4;
+    gStatusBar = WinCreateWindow( gGroup, WC_BUTTON, "atui",
+                                  WS_VISIBLE | BS_TEXT | BS_AUTOSIZE,
+                                  0, 0, 0, 0, gGroup, HWND_TOP,
+                                  0, NULL, NULL );
+    if( gStatusBar != 0 )
+        {
+        /* BS_AUTOSIZE sized the button to its text (eFTE reads a created
+           button's size the same way, g_pm.cpp:753); the height it chose
+           is the strip's height, measured by the toolkit itself. */
+        SWP swp;
+        WinQueryWindowPos( gStatusBar, &swp );
+        if( swp.cy >= 8 )
+            gStatusH = swp.cy;
+        }
+    else
+        pmLogErr( "status create" );
+    gEntry = WinCreateWindow( gGroup, WC_ENTRYFIELD, "",
+                              WS_VISIBLE | WS_TABSTOP | ES_MARGIN
+                                | ES_AUTOSCROLL,
+                              0, 0, 0, 0, gGroup, HWND_TOP,
+                              0, NULL, NULL );
+    if( gEntry != 0 )
+        {
+        gOldEntryProc = WinSubclassWindow( gEntry, pmEntryProc );
+        if( gOldEntryProc == 0 )
+            pmLogErr( "entry subclass" );
+        }
+    else
+        {
+        pmLogErr( "entry create" );
+        gEntryH = 0;
+        }
+    if( gStatusBar == 0 )
+        gStatusH = 0;
+    if( gLog != 0 )
+        fprintf( gLog, "chrome entry %ld status %ld\n",
+                 (long) gEntryH, (long) gStatusH ), fflush( gLog );
 
     /* The scrollbar, eFTE's recipe verbatim (g_pm.cpp:1454): the class,
        the styles, the zero rect -- WM_SIZE below lays it out the way it
        lays out everything else.  SBS_AUTOTRACK so a dragged thumb talks
-       as it moves; owner is the client, and to the client its WM_VSCROLL
+       as it moves; owner is the page, and to the page its WM_VSCROLL
        comes.  How many pixels the bar takes, the system says. */
     gSbW = (LONG) WinQuerySysValue( HWND_DESKTOP, SV_CXVSCROLL );
     if( gSbW < 0 )
@@ -1847,15 +2093,16 @@ static void pmOpenWindow()
                  gAvioOk ? "ok" : "FAILED",
                  gCellPxW, gCellPxH ), fflush( gLog );
 
-    // Size the frame so the client is the grid exactly.  Watcom's
-    // WinCalcFrameRect has the third argument (pmwin.h:1415, a BOOL); it
-    // converts the given client rect in place, so the grid rect goes in
-    // and the frame rect comes out.
+    // Size the frame so the client is the grid plus the chrome strips
+    // exactly.  Watcom's WinCalcFrameRect has the third argument (pmwin.h:
+    // 1415, a BOOL); it converts the given client rect in place, so the
+    // grid rect goes in and the frame rect comes out.
     RECTL rcl;
     rcl.xLeft = 0;
     rcl.yBottom = 0;
     rcl.xRight = (LONG) gCols * (LONG) gCellPxW + gSbW;   // page plus the
-    rcl.yTop = (LONG) gRows * (LONG) gCellPxH;            // bar's column
+    rcl.yTop = (LONG) gRows * (LONG) gCellPxH              // bar's column,
+              + gEntryH + gStatusH;                        // strips below
     WinCalcFrameRect( gFrame, &rcl, 0 );
     if( gLog != 0 )
         fprintf( gLog, "grid %ux%u cell %ux%u frame %ldx%ld\n",
@@ -1892,7 +2139,10 @@ static void pmOpenWindow()
         y = 2;
     WinSetWindowPos( gFrame, HWND_TOP, x, y, frameW, frameH,
                      SWP_SIZE | SWP_MOVE | SWP_ACTIVATE | SWP_SHOW );
-    WinSetFocus( HWND_DESKTOP, gClient );
+    // The keyboard starts where the user will type.  Without an entry
+    // field there is nothing else to answer, and the page takes focus as
+    // it always did.
+    WinSetFocus( HWND_DESKTOP, gEntry != 0 ? gEntry : gClient );
     gPmUp = True;
     pmLog( "shown" );
 
@@ -1931,6 +2181,10 @@ static void pmCloseWindow()
         gFrame = 0;                   // the window, as PM arranges;
         gClient = 0;                  // forget the handle, do not post
         gSbar = 0;                    // into it ever again
+        gGroup = 0;                   // group, page, entry, status: the
+        gEntry = 0;                   // whole tree came down with the
+        gStatusBar = 0;               // frame and its old procedures are
+        gOldEntryProc = 0;            // meaningless now
         }
     if( gHmq != 0 )
         {
@@ -1943,6 +2197,53 @@ static void pmCloseWindow()
         gHab = 0;
         }
     gPmUp = False;
+}
+
+/* The two kit entries of the window's chrome (src/tui/pmdialogs.h), wired
+   into kPmDialogs by pmdlg.cpp.
+
+   The status line is one PM button -- the toolkit's own idiom for the
+   bottom of a window, painting its face itself so nothing of the page
+   can show through it.  The application composes the whole line; this
+   just hands PM the words.
+
+   keysToPage is the keyboard's traffic light: the entry field owns the
+   keys on the main screen, and while a tvision dialog runs its keys
+   belong to the page window or the dialog starves.  The count nests --
+   a dialog that opens a dialog leaves the keys with the page until the
+   last one closes -- and the focus moves only at the transitions, so
+   nothing ever yanks the caret from under the user mid-dialog. */
+extern "C" void pmStatusKit( const char *text )
+{
+    if( gStatusBar != 0 && text != 0 )
+        WinSetWindowText( gStatusBar, (PSZ) text );
+}
+
+extern "C" void pmKeysToPageKit( int on )
+{
+    if( on )
+        {
+        if( ++gKeysOnPage == 1 && gClient != 0 && gGroup != 0 )
+            WinSetFocus( gGroup, gClient );
+        }
+    else
+        {
+        if( gKeysOnPage > 0 )
+            --gKeysOnPage;
+        if( gKeysOnPage == 0 && gEntry != 0 && gGroup != 0 )
+            WinSetFocus( gGroup, gEntry );
+        }
+}
+
+/* After a native modal closes, PM leaves the focus wherever the dialog
+   took it from -- and that was the entry field, but "was" is doing a lot
+   of work if anything else intervened.  Ask for it back by name; the
+   keys-to-page counter says no if a tvision dialog is still running and
+   the page is the right owner. */
+extern "C" void pmGiveEntryFocus( void )
+{
+    if( gEntry != 0 && gGroup != 0 && gKeysOnPage == 0 )
+        WinSetFocus( gGroup, gEntry );
 }
 
 THardwareInfo::THardwareInfo() noexcept

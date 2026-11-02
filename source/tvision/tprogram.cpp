@@ -366,18 +366,21 @@ void TProgram::resizeScreen( ushort w, ushort h )
     // screen, which after a grow is nothing at all -- prompt and status
     // line vanished, measured on the box.
     //
-    // The desktop's rect excludes the status row: that is the geometry
-    // the app's own layout was built against, and it is what keeps the
-    // desktop from ever reaching over the status line's row. The status
-    // line is moved last, so whatever order the drawing falls out in,
-    // its row is painted after the desktop covered the screen with
-    // blanks.
+    // The desktop's rect excludes the status row *when there is one*:
+    // that is the geometry the app's own layout was built against, and it
+    // is what keeps the desktop from ever reaching over the status line's
+    // row.  A front whose status line lives outside the grid (the windowed
+    // PM front hands that row to a native control) passes none, and the
+    // desktop takes the full height -- there is no row to keep from
+    // overlapping.  The status line is moved last, so whatever order the
+    // drawing falls out in, its row is painted after the desktop covered
+    // the screen with blanks.
     TRect r( 0, 0, w, h );
     changeBounds( r );                          // the application group
     if( menuBar )
         menuBar->changeBounds( TRect( 0, 0, w, 1 ) );
     if( deskTop )
-        deskTop->changeBounds( TRect( 0, 0, w, h - 1 ) );
+        deskTop->changeBounds( TRect( 0, 0, w, statusLine ? h - 1 : h ) );
     if( statusLine )
         statusLine->changeBounds( TRect( 0, h-1, w, h ) );
     setState( sfExposed, False );
