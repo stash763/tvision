@@ -321,7 +321,6 @@ static HWND   gStatusBar    = 0;
 static LONG   gEntryH       = 0;
 static LONG   gStatusH      = 0;
 static int    gKeysOnPage   = 0;   // the kit's keysToPage counter
-static Boolean gEntryFocusLogged = False;
 
 /* The prompt is a WC_MLE -- the box's own multiline textbox, native
    editing, caret, selection, clipboard and undo and all -- and it is
@@ -1222,8 +1221,21 @@ static HWND pmCreateEntry( void )
     cd.iptAnchor.lColumn = 0;
     cd.iptCursor.lLine = 0;
     cd.iptCursor.lColumn = 0;
-    cd.cxFormat = 0;                      // MATCHWINDOW: follow the window
-    cd.cyFormat = 0;
+    /* Real format-rectangle dimensions, not the zero the previous
+       build passed: word wrap breaks text at the FORMAT RECTANGLE,
+       and a rectangle of none may well be why the stamped build
+       wrapped nothing no matter what MLS_WORDWRAP asked.  The group's
+       measure and the one-line strip's height both exist by this
+       moment; the width is over-counted by 16 pixels of border and
+       margin because a wrap a hair early is invisible and a wrap
+       never happening is not.  MATCHWINDOW keeps the rectangle
+       following the window from here on. */
+    RECTL gr;
+    WinQueryWindowRect( gGroup, &gr );
+    cd.cxFormat = ( gr.xRight - gr.xLeft ) - 16;
+    if( cd.cxFormat < 64 )
+        cd.cxFormat = 64;
+    cd.cyFormat = gEntryH > 0 ? gEntryH : 24;
     cd.afFormatFlags = MLFFMTRECT_MATCHWINDOW;
     cd.pHWXCtlData = 0;
     const HWND h = WinCreateWindow( gGroup, WC_MLE, "",
@@ -1258,23 +1270,30 @@ static HWND pmCreateEntry( void )
             fprintf( gLog, "entry lineh %ld desc %ld\n",
                      (long) gMleLineH, (long) gMleDesc ), fflush( gLog );
         }
-    /* The birth probe, toolkit calls only: insert, export, delete.  The
-       numbers land next to the first line the user reads, and they say
-       in one session whether this MLE holds and gives back text -- the
-       one thing every other round had to infer from silence. */
+    /* The birth probe, toolkit calls only: insert, query, export the
+       exact count, delete.  The numbers land next to the first line
+       the user reads, and they say in one session whether this MLE
+       holds and gives back text -- every return value included, since
+       the stamped build of 2026-11-02 proved the middle step has a
+       shape this control cares about. */
     {
         static char probe[ 64 ];
-        WinSendMsg( h, MLM_INSERT, MPFROMP( "probe" ), MPVOID );
-        ULONG off = 0;
-        ULONG cb = (ULONG) sizeof( probe ) - 1;
-        WinSendMsg( h, MLM_SETIMPORTEXPORT, MPFROMP( probe ),
-                    MPFROMLONG( sizeof( probe ) - 1 ) );
-        WinSendMsg( h, MLM_EXPORT, MPFROMP( &off ), MPFROMLONG( &cb ) );
+        const MRESULT ir = WinSendMsg( h, MLM_INSERT,
+                                       MPFROMP( "probe" ), MPVOID );
         const LONG q = (LONG) WinSendMsg( h, MLM_QUERYTEXTLENGTH,
                                           MPVOID, MPVOID );
+        ULONG cb = ( q > 0 && (ULONG) q < sizeof( probe ) - 1 )
+                   ? (ULONG) q : (ULONG) sizeof( probe ) - 1;
+        const MRESULT ir2 = WinSendMsg( h, MLM_SETIMPORTEXPORT, MPFROMP( probe ),
+                                        MPFROMLONG( sizeof( probe ) - 1 ) );
+        ULONG off = 0;
+        const MRESULT er = WinSendMsg( h, MLM_EXPORT, MPFROMP( &off ),
+                                       MPFROMLONG( &cb ) );
         if( gLog != 0 )
-            fprintf( gLog, "prompt probe export=%lu query=%ld text=%.8s\n",
-                     (unsigned long) cb, (long) q, probe ), fflush( gLog );
+            fprintf( gLog, "prompt probe ins=%ld q=%ld ie=%ld exp=%ld "
+                     "cb=%lu text=%.8s\n",
+                     (long) ir, (long) q, (long) ir2, (long) er,
+                     (unsigned long) cb, probe ), fflush( gLog );
         WinSendMsg( h, MLM_DELETE, MPFROMLONG( 0 ), MPFROMLONG( 65536 ) );
         gPromptHash = 0;
     }
@@ -1371,20 +1390,37 @@ static void pmPromptGrow_( LONG lines )
     WinSendMsg( gGroup, WM_SIZE, MPVOID, MPVOID );
 }
 
-/* The text as the control has it, in the samples' own two steps:
-   hand over the buffer (sty_file.c:494), ask for bytes from offset
-   0 (sty_file.c:501), and the count that returns is the text that
-   arrived.  The query the sample makes first (sty_file.c:475) is
-   the one this box answers with zero, so the ask is the whole
-   buffer and the belief is the returned count. */
+/* The text as the control has it, in the samples' own three steps --
+   and now literally the samples' steps, including the query the box
+   finally answers: query the length first (sty_file.c:475) and ask
+   for exactly that many bytes (sty_file.c:493: cbExport = ulFileLen,
+   never more).  This is a measured lesson, not style: asking for the
+   whole 63-byte buffer over 5 characters of text made this MLE export
+   nothing at all -- `prompt probe export=0 query=5`, stamped build
+   16:15:59 -- while the sample's exact count is the shape it has
+   always answered.  A zero query means empty, and export is not
+   needed at all; a query lying low would only miss one beat, and the
+   next corrects it. */
 static Boolean pmPromptPeek_( char *buf, ULONG cap, ULONG *outLen )
 {
+    ULONG n = (ULONG) WinSendMsg( gEntry, MLM_QUERYTEXTLENGTH,
+                                  MPVOID, MPVOID );
+    if( n == 0 )
+        {
+        buf[ 0 ] = '\0';
+        *outLen = 0;
+        return True;
+        }
+    if( n > cap - 1 )
+        n = cap - 1;
     if( WinSendMsg( gEntry, MLM_SETIMPORTEXPORT, MPFROMP( buf ),
                     MPFROMLONG( cap - 1 ) ) == 0 )
         return False;
     ULONG off = 0;
-    ULONG cb = cap - 1;
-    WinSendMsg( gEntry, MLM_EXPORT, MPFROMP( &off ), MPFROMLONG( &cb ) );
+    ULONG cb = n;
+    if( WinSendMsg( gEntry, MLM_EXPORT, MPFROMP( &off ),
+                    MPFROMLONG( &cb ) ) == 0 )
+        return False;
     if( cb > cap - 1 )
         cb = cap - 1;
     buf[ cb ] = '\0';
@@ -1458,6 +1494,52 @@ static void pmPromptPoll( void )
 {
     if( gEntry == 0 || gMleLineH <= 0 || gGroup == 0 )
         return;
+    /* Once per session, after the tiling has given the prompt its
+       real size: ask the control its own format rectangle, apply the
+       documented corrective -- MLM_SETFORMATRECT with the measured
+       size and MLFFMTRECT_MATCHWINDOW (MLEFORMATRECT and the
+       MLFFMTRECT_* flags are the toolkit's own, pmmle.h:63 and :85)
+       -- and re-query.  The two numbers before and after, plus the
+       raw wrap-state answer, tell the whole story of why text does
+       or does not break at the window edge, and the re-query is the
+       control's word, not this file's hope.  Convention safety: the
+       query is handed THIS struct to fill; whatever the control
+       means by its answer, no pointer of its invention is ever read. */
+    static int sFmtProbed = 0;
+    if( !sFmtProbed )
+        {
+        ++sFmtProbed;
+        MLEFORMATRECT fr;
+        fr.cxFormat = 0;
+        fr.cyFormat = 0;
+        const MRESULT q1 = WinSendMsg( gEntry, MLM_QUERYFORMATRECT,
+                                       MPFROMP( &fr ), MPVOID );
+        const LONG w0 = fr.cxFormat, h0 = fr.cyFormat;
+        RECTL er;
+        WinQueryWindowRect( gEntry, &er );
+        fr.cxFormat = ( er.xRight - er.xLeft ) - 16;
+        if( fr.cxFormat < 64 )
+            fr.cxFormat = 64;
+        fr.cyFormat = er.yTop - er.yBottom;
+        if( fr.cyFormat < 8 )
+            fr.cyFormat = 8;
+        const MRESULT sr = WinSendMsg( gEntry, MLM_SETFORMATRECT,
+                                       MPFROMP( &fr ),
+                                       MPFROMLONG( MLFFMTRECT_MATCHWINDOW ) );
+        fr.cxFormat = 0;
+        fr.cyFormat = 0;
+        const MRESULT q2 = WinSendMsg( gEntry, MLM_QUERYFORMATRECT,
+                                       MPFROMP( &fr ), MPVOID );
+        const LONG wr = (LONG) WinSendMsg( gEntry, MLM_QUERYWRAP,
+                                           MPVOID, MPVOID );
+        if( gLog != 0 )
+            fprintf( gLog, "prompt fmtrect q1=%ld:%ldx%ld set=%ld(%ldx%ld) "
+                     "q2=%ld:%ldx%ld wrap=%ld\n",
+                     (long) q1, (long) w0, (long) h0,
+                     (long) sr, (long) fr.cxFormat, (long) fr.cyFormat,
+                     (long) q2, (long) fr.cxFormat, (long) fr.cyFormat,
+                     (long) wr ), fflush( gLog );
+        }
     if( ++gPollBeat < 8 )
         return;
     gPollBeat = 0;
