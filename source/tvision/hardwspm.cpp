@@ -1172,77 +1172,28 @@ static void pmSnapSWP( HWND hwndFrame, PSWP pswp )
     pswp->cy = newCy;
 }
 
-/* The MLE's documented creation data (the EDM/2 WinCreateWindow
-   reference names MLECTLDATA for the class; IBM's own shape is
-   pmmle.h:70).  Two things it does that no after-the-fact message
-   replicated: the text limit arrives before the window exists, and
-   MLFFMTRECT_MATCHWINDOW ties the formatting rectangle to the
-   window -- the wrap follows every tile of the strip.  The struct is
-   transcribed from the toolkit and NOT taken from Watcom's header:
-   Watcom typedefs IPT as a bare LONG (pmwin.h:1870) where IBM's IPT
-   is a pair of longs, and passing the 4 bytes-per-point shape to a
-   control that parses 8 would scatter the fields.  The two zero
-   format dimensions are the "derive it yourself" convention that
-   MATCHWINDOW implies: the MLE takes the size from its window. */
-typedef struct
-    {
-    LONG lLine;
-    LONG lColumn;
-    } AtuiIpt;
-typedef struct
-    {
-    USHORT cbCtlData;
-    USHORT afIEFormat;
-    ULONG  cchText;
-    AtuiIpt iptAnchor;
-    AtuiIpt iptCursor;
-    LONG   cxFormat;
-    LONG   cyFormat;
-    ULONG  afFormatFlags;
-    PVOID  pHWXCtlData;
-    } AtuiMleCtlData;
-
-/* Make the prompt: the box's own multiline textbox, word wrap on at
-   birth the way the toolkit creates one (sty_dlg.c:1703 --
-   WS_VISIBLE|MLS_WORDWRAP), and read the same way (the export pair,
-   sty_file.c:494).  Font metrics come from the control's own PS -- the
-   same measurement that has answered 20 pixels every round -- and the
-   birth asks the control one question it can prove with: insert
-   through the mcispy call, export what comes back, delete it again.
-   If the box answers zero to a text it was told to hold, that is a
-   fact worth having before the user trusts the box with a message. */
+/* Make the prompt the way the toolkit's own wrapping MLE is made --
+   and now the comparison is no longer fragmentary: every MLM call in
+   the pm/controls sample has been inventoried, and none of them is a
+   format-rectangle message, a wrap message, or a control-data
+   structure.  The wrapping variant (sty_dlg.c:1703) is created
+   WS_VISIBLE|MLS_WORDWRAP at 0,0,0,0 with control data NULL and it
+   ships working; the scrolling editor variant (sty_init.c:147) is
+   MLS_HSCROLL|MLS_VSCROLL, which is the same control asked NOT to
+   wrap.  The MLECTLDATA this file passed at the two previous births
+   -- 0x0 format rectangle the first time, measured dimensions the
+   second -- was the only home-invention left on the prompt, and both
+   those births wrapped nothing.  Text limit stays a plain
+   MLM_SETTEXTLIMIT after birth; the sample never needs one, the 4k
+   promise is ours, and a LONG-argument message has no convention to
+   get wrong. */
 static HWND pmCreateEntry( void )
 {
-    AtuiMleCtlData cd;
-    cd.cbCtlData = (USHORT) sizeof( cd );
-    cd.afIEFormat = MLFIE_CFTEXT;         // plain text; CR/LF newlines
-    cd.cchText = (ULONG) kEntryMaxChars;  // the 4k, from the first byte
-    cd.iptAnchor.lLine = 0;
-    cd.iptAnchor.lColumn = 0;
-    cd.iptCursor.lLine = 0;
-    cd.iptCursor.lColumn = 0;
-    /* Real format-rectangle dimensions, not the zero the previous
-       build passed: word wrap breaks text at the FORMAT RECTANGLE,
-       and a rectangle of none may well be why the stamped build
-       wrapped nothing no matter what MLS_WORDWRAP asked.  The group's
-       measure and the one-line strip's height both exist by this
-       moment; the width is over-counted by 16 pixels of border and
-       margin because a wrap a hair early is invisible and a wrap
-       never happening is not.  MATCHWINDOW keeps the rectangle
-       following the window from here on. */
-    RECTL gr;
-    WinQueryWindowRect( gGroup, &gr );
-    cd.cxFormat = ( gr.xRight - gr.xLeft ) - 16;
-    if( cd.cxFormat < 64 )
-        cd.cxFormat = 64;
-    cd.cyFormat = gEntryH > 0 ? gEntryH : 24;
-    cd.afFormatFlags = MLFFMTRECT_MATCHWINDOW;
-    cd.pHWXCtlData = 0;
     const HWND h = WinCreateWindow( gGroup, WC_MLE, "",
                                     WS_VISIBLE | WS_TABSTOP | MLS_WORDWRAP
                                       | MLS_BORDER,
                                     0, 0, 0, 0, gGroup, HWND_TOP,
-                                    0, &cd, NULL );
+                                    0, NULL, NULL );
     if( h == 0 )
         return 0;
     const LONG fit = (LONG) WinSendMsg( h, MLM_SETTEXTLIMIT,
@@ -1418,13 +1369,21 @@ static Boolean pmPromptPeek_( char *buf, ULONG cap, ULONG *outLen )
         return False;
     ULONG off = 0;
     ULONG cb = n;
-    if( WinSendMsg( gEntry, MLM_EXPORT, MPFROMP( &off ),
-                    MPFROMLONG( &cb ) ) == 0 )
-        return False;
-    if( cb > cap - 1 )
-        cb = cap - 1;
-    buf[ cb ] = '\0';
-    *outLen = cb;
+    const MRESULT r = WinSendMsg( gEntry, MLM_EXPORT, MPFROMP( &off ),
+                                  MPFROMLONG( &cb ) );
+    /* Which slot carries the count is measured, not hoped: this box
+       returned the exported length in the MRESULT and zero in the
+       cb parameter -- `prompt probe ins=5 q=5 ie=1 exp=5 cb=0`,
+       stamped 17:02:34, with the text sitting in the buffer.  The
+       sample's cb convention rides as fallback for builds that
+       answer that way. */
+    ULONG got = (ULONG) (LONG) r;
+    if( got == 0 )
+        got = cb;
+    if( got > cap - 1 )
+        got = cap - 1;
+    buf[ got ] = '\0';
+    *outLen = got;
     return True;
 }
 
@@ -1494,52 +1453,20 @@ static void pmPromptPoll( void )
 {
     if( gEntry == 0 || gMleLineH <= 0 || gGroup == 0 )
         return;
-    /* Once per session, after the tiling has given the prompt its
-       real size: ask the control its own format rectangle, apply the
-       documented corrective -- MLM_SETFORMATRECT with the measured
-       size and MLFFMTRECT_MATCHWINDOW (MLEFORMATRECT and the
-       MLFFMTRECT_* flags are the toolkit's own, pmmle.h:63 and :85)
-       -- and re-query.  The two numbers before and after, plus the
-       raw wrap-state answer, tell the whole story of why text does
-       or does not break at the window edge, and the re-query is the
-       control's word, not this file's hope.  Convention safety: the
-       query is handed THIS struct to fill; whatever the control
-       means by its answer, no pointer of its invention is ever read. */
-    static int sFmtProbed = 0;
-    if( !sFmtProbed )
-        {
-        ++sFmtProbed;
-        MLEFORMATRECT fr;
-        fr.cxFormat = 0;
-        fr.cyFormat = 0;
-        const MRESULT q1 = WinSendMsg( gEntry, MLM_QUERYFORMATRECT,
-                                       MPFROMP( &fr ), MPVOID );
-        const LONG w0 = fr.cxFormat, h0 = fr.cyFormat;
-        RECTL er;
-        WinQueryWindowRect( gEntry, &er );
-        fr.cxFormat = ( er.xRight - er.xLeft ) - 16;
-        if( fr.cxFormat < 64 )
-            fr.cxFormat = 64;
-        fr.cyFormat = er.yTop - er.yBottom;
-        if( fr.cyFormat < 8 )
-            fr.cyFormat = 8;
-        const MRESULT sr = WinSendMsg( gEntry, MLM_SETFORMATRECT,
-                                       MPFROMP( &fr ),
-                                       MPFROMLONG( MLFFMTRECT_MATCHWINDOW ) );
-        fr.cxFormat = 0;
-        fr.cyFormat = 0;
-        const MRESULT q2 = WinSendMsg( gEntry, MLM_QUERYFORMATRECT,
-                                       MPFROMP( &fr ), MPVOID );
-        const LONG wr = (LONG) WinSendMsg( gEntry, MLM_QUERYWRAP,
-                                           MPVOID, MPVOID );
-        if( gLog != 0 )
-            fprintf( gLog, "prompt fmtrect q1=%ld:%ldx%ld set=%ld(%ldx%ld) "
-                     "q2=%ld:%ldx%ld wrap=%ld\n",
-                     (long) q1, (long) w0, (long) h0,
-                     (long) sr, (long) fr.cxFormat, (long) fr.cyFormat,
-                     (long) q2, (long) fr.cxFormat, (long) fr.cyFormat,
-                     (long) wr ), fflush( gLog );
-        }
+    /* No format/wrap probe lives here any more.  The stamped build
+       of 17:02:34 died between wait #1 and wait #2 with this file's
+       first poll in between: MLM_QUERYFORMATRECT, MLM_SETFORMATRECT
+       and MLM_QUERYWRAP exist in the headers as NUMBERS, and their
+       parameter conventions are documented nowhere on the mirrors --
+       and a control that receives a flags value where it expects a
+       write pointer obeys it literally.  Lesson, written where it
+       belongs: a message number is not an interface; the parameter
+       convention is, and only observation documents it.  The format
+       rectangle's one convention that IS documented is MLECTLDATA
+       at creation (WinCreateWindow's own reference), and that is
+       where the rectangle's shape now lives, real dimensions and
+       MLFFMTRECT_MATCHWINDOW included -- visible at the screen
+       rather than in a log. */
     if( ++gPollBeat < 8 )
         return;
     gPollBeat = 0;
