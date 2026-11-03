@@ -347,9 +347,19 @@ static int    gKeysOnPage   = 0;   // the kit's keysToPage counter
      gMleDesc     the same font's descent (Watcom's name: lMaxDescender);
      gPromptHash  hash of the text as the last export saw it: change is
                   the only signal the growth engine needs;
-     gPromptLines the wrapped-line count of the last count, uncapped:
-                  at or above the settings cap the keystroke path has
-                  nothing left to grow toward and stops exporting;
+     gPromptLines the wrapped-line count the strip currently answers to,
+                  uncapped: at or above the settings cap the keystroke
+                  path has nothing left to grow toward and stops
+                  exporting;
+     gPromptSaw   a smaller count awaiting its second witness -- no
+                  shrink ever lands on one sighting (the 2026-11-03
+                  session died to a single read that answered empty
+                  while the box held five lines of text);
+     gPromptLen   text length at the last count, so an empty read is
+                  knowably a lie while it says otherwise;
+     gMleBuf      the one export buffer, armed at birth and never
+                  armed again, and gMleCb the bytes the last read put
+                  into it;
      gPollBeat    beats since the last export; every 8th (~100 ms) is
                   instant to a person and nothing to a P4.
    Text ceiling: PM's entry-field default is 32; the MLE is memory-
@@ -359,10 +369,15 @@ static LONG   gEntryH1      = 0;
 static LONG   gMleLineH     = 0;
 static LONG   gMleDesc      = 0;
 static const LONG kEntryMaxChars = 4096;
+static char   gMleBuf[ kEntryMaxChars + 2 ];
+static ULONG  gMleCb        = 0;
 static ULONG  gPromptHash   = 0;
 static int    gPollBeat     = 0;
 static LONG   gPromptW      = 0;    // width the last layout counted over
-static LONG   gPromptLines  = 1;    // wrapped lines, uncapped, of the last count
+static LONG   gPromptLines  = 1;    // lines the strip answers to, uncapped
+static LONG   gPromptSaw    = 0;    // pending smaller count, 0 = none
+static LONG   gPromptLen    = 0;    // length at the last count
+static Boolean gPromptSuspect = False;  // last read lied empty; keys lay off
 
 /* The transcript is app knowledge; the bar is the driver's.  app.cpp
    (src/tui) implements the first two -- extent of the line list, and a
@@ -1275,17 +1290,27 @@ static HWND pmCreateEntry( void )
        the user reads, and they say in one session whether this MLE
        holds and gives back text -- every return value included, since
        the stamped build of 2026-11-02 proved the middle step has a
-       shape this control cares about. */
+       shape this control cares about.
+         The probe call is also where the one buffer arming lives:
+       MLM_SETIMPORTEXPORT names the buffer every later MLM_EXPORT
+       fills, and it is armed here for the life of the control and
+       never touched again.  That is the samples' own usage -- their
+       chunked export loops run one SETIMPORTEXPORT followed by
+       repeated EXPORTs -- and the box's reason: the 2026-11-03
+       session, whose keystroke path re-armed on every read, ended
+       with every read answering empty and never recovering.  Whether
+       the arming or the read rate was the poison, one arming removes
+       the arming from the question. */
     {
-        static char probe[ 64 ];
         const MRESULT ir = WinSendMsg( h, MLM_INSERT,
                                        MPFROMP( "probe" ), MPVOID );
         const LONG q = (LONG) WinSendMsg( h, MLM_QUERYTEXTLENGTH,
                                           MPVOID, MPVOID );
-        ULONG cb = ( q > 0 && (ULONG) q < sizeof( probe ) - 1 )
-                   ? (ULONG) q : (ULONG) sizeof( probe ) - 1;
-        const MRESULT ir2 = WinSendMsg( h, MLM_SETIMPORTEXPORT, MPFROMP( probe ),
-                                        MPFROMLONG( sizeof( probe ) - 1 ) );
+        ULONG cb = ( q > 0 && (ULONG) q < (ULONG) kEntryMaxChars )
+                   ? (ULONG) q : 4;
+        const MRESULT ir2 = WinSendMsg( h, MLM_SETIMPORTEXPORT,
+                                        MPFROMP( gMleBuf ),
+                                        MPFROMLONG( kEntryMaxChars ) );
         ULONG off = 0;
         const MRESULT er = WinSendMsg( h, MLM_EXPORT, MPFROMP( &off ),
                                        MPFROMLONG( &cb ) );
@@ -1293,7 +1318,7 @@ static HWND pmCreateEntry( void )
             fprintf( gLog, "prompt probe ins=%ld q=%ld ie=%ld exp=%ld "
                      "cb=%lu text=%.8s\n",
                      (long) ir, (long) q, (long) ir2, (long) er,
-                     (unsigned long) cb, probe ), fflush( gLog );
+                     (unsigned long) cb, gMleBuf ), fflush( gLog );
         WinSendMsg( h, MLM_DELETE, MPFROMLONG( 0 ), MPFROMLONG( 65536 ) );
         gPromptHash = 0;
     }
@@ -1413,64 +1438,96 @@ static void pmPromptGrow_( LONG lines )
     WinSendMsg( gGroup, WM_SIZE, MPVOID, MPVOID );
 }
 
-/* The one sizing step both hands share: count the given text over the
-   given width, remember the count, resize.  The remembered count is
-   uncapped -- it is what tells the keystroke path whether there is
-   any growing left to do.  The poll runs this on what changed; the
-   keystroke path (below) runs it on what the text is about to become,
-   which is the whole of the no-scroll promise: the strip is one line
-   taller before the character that wraps lands, so the control never
-   has a caret in content with no room and never scrolls away from
-   line one. */
-static void pmPromptSized_( const char *text, LONG n, LONG width )
+/* Applying a count.  Growth lands on the first sighting -- room
+   appears immediately, which is the whole point.  A count smaller
+   than the strip's waits for a second witness: the 2026-11-03
+   session showed why, where one read answered empty (every read
+   after it answered empty too) and a single obedient shrink folded
+   five lines of typing into a strip of one and the user's summary
+   was "if you keep going it resets to 1 line".  Two consecutive
+   equal smaller counts shrink the strip, so a real backspace still
+   lands within a poll-and-a-half (~160 ms, invisible) while a lone
+   lie never does. */
+static void pmPromptApply_( LONG lines )
 {
-    gPromptLines = pmPromptLines_( text, n, width );
-    pmPromptGrow_( gPromptLines );
+    if( lines < gPromptLines && lines != gPromptSaw )
+    {
+        static int sHoldLogs = 0;
+        if( gLog != 0 && sHoldLogs < 8 )
+            {
+            ++sHoldLogs;
+            fprintf( gLog, "prompt hold %ld saw %ld\n",
+                     (long) gPromptLines, (long) lines ), fflush( gLog );
+            }
+        gPromptSaw = lines;
+        return;
+    }
+    gPromptSaw = 0;
+    gPromptLines = lines;
+    pmPromptGrow_( lines );
 }
 
-/* The text as the control has it, in the samples' own three steps --
-   and now literally the samples' steps, including the query the box
-   finally answers: query the length first (sty_file.c:475) and ask
-   for exactly that many bytes (sty_file.c:493: cbExport = ulFileLen,
-   never more).  This is a measured lesson, not style: asking for the
-   whole 63-byte buffer over 5 characters of text made this MLE export
-   nothing at all -- `prompt probe export=0 query=5`, stamped build
-   16:15:59 -- while the sample's exact count is the shape it has
-   always answered.  A zero query means empty, and export is not
-   needed at all; a query lying low would only miss one beat, and the
-   next corrects it. */
-static Boolean pmPromptPeek_( char *buf, ULONG cap, ULONG *outLen )
+/* The one sizing step both hands share: count the given text over the
+   given width and apply the count.  The poll runs this on what the
+   text is; the keystroke path (below) runs it on what the text is
+   about to become, which is the whole of the no-scroll promise: the
+   strip is one line taller before the character that wraps lands, so
+   the control never has a caret in content with no room and never
+   scrolls away from line one. */
+static void pmPromptSized_( const char *text, LONG n, LONG width )
+{
+    gPromptLen = n;
+    pmPromptApply_( pmPromptLines_( text, n, width ) );
+}
+
+/* A read: query the length (sty_file.c:475), export exactly that many
+   bytes (sty_file.c:493: the exact count is the shape this box has
+   always answered -- asking the whole buffer over shorter text once
+   exported nothing at all), and take the count from wherever it
+   actually lands -- the MRESULT here, the cb parameter as the
+   samples' fallback, both proven by the birth probe's
+   `ins=5 q=5 ie=1 exp=5 cb=0`.  No arming: the buffer was named once
+   at birth and stands for the life of the control.
+     A read that answers empty while the last count knew of text is
+   marked suspect: the keystroke path lays off reading entirely until
+   a read disagrees, leaving only the 100 ms poll -- the rate that
+   served every session before the keystroke reads existed -- to find
+   the truth.  The empty lie is also logged, because it is the box
+   talking and the next log should name it. */
+static Boolean pmPromptRead_( void )
 {
     ULONG n = (ULONG) WinSendMsg( gEntry, MLM_QUERYTEXTLENGTH,
                                   MPVOID, MPVOID );
-    if( n == 0 )
-        {
-        buf[ 0 ] = '\0';
-        *outLen = 0;
-        return True;
-        }
-    if( n > cap - 1 )
-        n = cap - 1;
-    if( WinSendMsg( gEntry, MLM_SETIMPORTEXPORT, MPFROMP( buf ),
-                    MPFROMLONG( cap - 1 ) ) == 0 )
-        return False;
-    ULONG off = 0;
-    ULONG cb = n;
-    const MRESULT r = WinSendMsg( gEntry, MLM_EXPORT, MPFROMP( &off ),
-                                  MPFROMLONG( &cb ) );
-    /* Which slot carries the count is measured, not hoped: this box
-       returned the exported length in the MRESULT and zero in the
-       cb parameter -- `prompt probe ins=5 q=5 ie=1 exp=5 cb=0`,
-       stamped 17:02:34, with the text sitting in the buffer.  The
-       sample's cb convention rides as fallback for builds that
-       answer that way. */
-    ULONG got = (ULONG) (LONG) r;
-    if( got == 0 )
-        got = cb;
-    if( got > cap - 1 )
-        got = cap - 1;
-    buf[ got ] = '\0';
-    *outLen = got;
+    if( n > (ULONG) kEntryMaxChars )
+        n = (ULONG) kEntryMaxChars;
+    ULONG got = 0;
+    if( n > 0 )
+    {
+        ULONG off = 0;
+        ULONG cb = n;
+        const MRESULT r = WinSendMsg( gEntry, MLM_EXPORT, MPFROMP( &off ),
+                                      MPFROMLONG( &cb ) );
+        got = (ULONG) (LONG) r;
+        if( got == 0 )
+            got = cb;
+        if( got > n )
+            got = n;
+    }
+    gMleBuf[ got ] = '\0';
+    gMleCb = got;
+    if( got == 0 && gPromptLen > 0 )
+    {
+        gPromptSuspect = True;
+        static int sEmptyLogs = 0;
+        if( gLog != 0 && sEmptyLogs < 4 )
+            {
+            ++sEmptyLogs;
+            fprintf( gLog, "prompt empty read at len %ld\n",
+                     (long) gPromptLen ), fflush( gLog );
+            }
+    }
+    else if( got > 0 )
+        gPromptSuspect = False;
     return True;
 }
 
@@ -1514,11 +1571,8 @@ static ULONG pmUnCrlf_( char *p, ULONG n )
    Enter looks like a message that never sent. */
 static void pmPromptSubmitNow_( void )
 {
-    static char text[ kEntryMaxChars + 2 ];
-    ULONG cb = 0;
-    if( !pmPromptPeek_( text, sizeof( text ), &cb ) )
-        return;
-    cb = pmUnCrlf_( text, cb );
+    pmPromptRead_();
+    ULONG cb = pmUnCrlf_( gMleBuf, gMleCb );
     if( cb == 0 )
         return;                        // silence is not submitted
     if( gLog != 0 )
@@ -1526,9 +1580,12 @@ static void pmPromptSubmitNow_( void )
             fflush( gLog );
     WinSendMsg( gEntry, MLM_DELETE, MPFROMLONG( 0 ), MPFROMLONG( 65536 ) );
     gPromptHash = pmHash_( "", 0 );
+    gPromptLen = 0;
+    gPromptSaw = 0;
     gPromptLines = 1;
+    gPromptSuspect = False;   // this clear was done by our own hand
     pmPromptGrow_( 1 );
-    pmPromptSubmit( text );
+    pmPromptSubmit( gMleBuf );
 }
 
 /* Growth rides the wait loop's beat next to pmSyncScrollBar's.  One
@@ -1558,19 +1615,19 @@ static void pmPromptPoll( void )
     if( ++gPollBeat < 8 )
         return;
     gPollBeat = 0;
-    static char text[ kEntryMaxChars + 2 ];
-    ULONG cb = 0;
-    if( !pmPromptPeek_( text, sizeof( text ), &cb ) )
-        return;
-    const ULONG h = pmHash_( text, cb );
+    pmPromptRead_();
+    const ULONG h = pmHash_( gMleBuf, gMleCb );
     RECTL er;
     WinQueryWindowRect( gEntry, &er );
     const LONG w = er.xRight - er.xLeft;
-    if( h == gPromptHash && w == gPromptW )
+    /* The pending-shrink case outranks the hash skip: text that has
+       not changed still has to be counted a second time, or the
+       second witness never appears and the strip never shrinks. */
+    if( h == gPromptHash && w == gPromptW && gPromptSaw == 0 )
         return;
     gPromptHash = h;
     gPromptW = w;
-    pmPromptSized_( text, (LONG) cb, w );
+    pmPromptSized_( gMleBuf, (LONG) gMleCb, w );
 }
 
 /* Predictive growth: the sizing engine run on the future the pump is
@@ -1594,17 +1651,15 @@ static void pmPromptPreage_( char standin )
 {
     if( gEntry == 0 || gMleLineH <= 0 || gGroup == 0 )
         return;
-    if( gPromptLines >= pmPromptCap_() )
+    if( gPromptLines >= pmPromptCap_() || gPromptSuspect )
         return;
-    static char text[ kEntryMaxChars + 2 ];
-    ULONG cb = 0;
-    if( !pmPromptPeek_( text, sizeof( text ) - 2, &cb ) )
-        return;
-    text[ cb ] = standin;
-    text[ cb + 1 ] = '\0';
+    pmPromptRead_();
+    if( gPromptSuspect )
+        return;                 // this read lied; the poll is trusted
+    gMleBuf[ gMleCb ] = standin;
     RECTL er;
     WinQueryWindowRect( gEntry, &er );
-    pmPromptSized_( text, (LONG) cb + 1, er.xRight - er.xLeft );
+    pmPromptSized_( gMleBuf, (LONG) gMleCb + 1, er.xRight - er.xLeft );
 }
 
 /* The prompt's keys, taken at the pump: deliverMessage is the one
