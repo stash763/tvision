@@ -347,6 +347,9 @@ static int    gKeysOnPage   = 0;   // the kit's keysToPage counter
      gMleDesc     the same font's descent (Watcom's name: lMaxDescender);
      gPromptHash  hash of the text as the last export saw it: change is
                   the only signal the growth engine needs;
+     gPromptLines the wrapped-line count of the last count, uncapped:
+                  at or above the settings cap the keystroke path has
+                  nothing left to grow toward and stops exporting;
      gPollBeat    beats since the last export; every 8th (~100 ms) is
                   instant to a person and nothing to a P4.
    Text ceiling: PM's entry-field default is 32; the MLE is memory-
@@ -359,6 +362,7 @@ static const LONG kEntryMaxChars = 4096;
 static ULONG  gPromptHash   = 0;
 static int    gPollBeat     = 0;
 static LONG   gPromptW      = 0;    // width the last layout counted over
+static LONG   gPromptLines  = 1;    // wrapped lines, uncapped, of the last count
 
 /* The transcript is app knowledge; the bar is the driver's.  app.cpp
    (src/tui) implements the first two -- extent of the line list, and a
@@ -375,6 +379,7 @@ void pmTranscriptJump( int line );
 void pmPromptSubmit( const char *text );
 void pmTranscriptPage( int direction );
 void pmToggleThinking( void );
+int  pmKitPromptLines( void );
 }
 static Boolean gAvioOk   = False;
 static Boolean gPmUp    = False; // window + queue exist; drawing is legal
@@ -1355,12 +1360,35 @@ static LONG pmPromptLines_( const char *text, LONG len, LONG width )
     return total > 0 ? total : 1;
 }
 
+/* The configurable height cap of the strip (Options > Settings): it
+   grows with the text to this many wrapped lines and lets the
+   control's native scrolling follow the caret beyond.  Whatever the
+   settings file or the dialog handed over comes through the app's
+   own clamp on the way here; this one guards the last mile, because
+   the next question asked of this number is how many pixels of
+   window to make. */
+static LONG pmPromptCap_( void )
+{
+    int n = pmKitPromptLines();
+    if( n < 1 )
+        n = 1;
+    if( n > 40 )
+        n = 40;   /* taller than any screen this ships to */
+    return (LONG) n;
+}
+
 /* The strip the line count asks for: never the page below its
-   minimum, the group's tiling for everything else. */
+   minimum, the group's tiling for everything else.  The settings cap
+   lands here -- counts beyond it get the capped height and nothing
+   more, which is exactly the promised "stays visible to N lines,
+   then begins scrolling". */
 static void pmPromptGrow_( LONG lines )
 {
     if( gGroup == 0 )
         return;
+    const LONG cap = pmPromptCap_();
+    if( lines > cap )
+        lines = cap;
     RECTL gr;
     WinQueryWindowRect( gGroup, &gr );
     LONG maxH = ( gr.yTop - gr.yBottom ) - gStatusH
@@ -1383,6 +1411,21 @@ static void pmPromptGrow_( LONG lines )
                  (long) lines, (long) gEntryH ), fflush( gLog );
         }
     WinSendMsg( gGroup, WM_SIZE, MPVOID, MPVOID );
+}
+
+/* The one sizing step both hands share: count the given text over the
+   given width, remember the count, resize.  The remembered count is
+   uncapped -- it is what tells the keystroke path whether there is
+   any growing left to do.  The poll runs this on what changed; the
+   keystroke path (below) runs it on what the text is about to become,
+   which is the whole of the no-scroll promise: the strip is one line
+   taller before the character that wraps lands, so the control never
+   has a caret in content with no room and never scrolls away from
+   line one. */
+static void pmPromptSized_( const char *text, LONG n, LONG width )
+{
+    gPromptLines = pmPromptLines_( text, n, width );
+    pmPromptGrow_( gPromptLines );
 }
 
 /* The text as the control has it, in the samples' own three steps --
@@ -1483,6 +1526,7 @@ static void pmPromptSubmitNow_( void )
             fflush( gLog );
     WinSendMsg( gEntry, MLM_DELETE, MPFROMLONG( 0 ), MPFROMLONG( 65536 ) );
     gPromptHash = pmHash_( "", 0 );
+    gPromptLines = 1;
     pmPromptGrow_( 1 );
     pmPromptSubmit( text );
 }
@@ -1526,7 +1570,41 @@ static void pmPromptPoll( void )
         return;
     gPromptHash = h;
     gPromptW = w;
-    pmPromptGrow_( pmPromptLines_( text, (LONG) cb, w ) );
+    pmPromptSized_( text, (LONG) cb, w );
+}
+
+/* Predictive growth: the sizing engine run on the future the pump is
+   holding.  When a plain insertion (any printable key, or Shift+
+   Enter's newline) is about to be dispatched to the MLE, the count is
+   taken over what the text is about to become -- the exported bytes
+   plus one stand-in character -- and if that count wants a taller
+   strip, the strip resizes synchronously before the character
+   arrives.  The order is an observed fact, not courtesy: this control
+   scrolls the moment the caret lands in content the window has no
+   room for, and a growth that comes a beat later does not undo the
+   scroll -- that is precisely the first-line-disappears the box
+   reported.  Once the remembered count has reached the settings cap
+   there is nothing left to grow toward (scrolling is then the
+   configured behaviour), and this returns on one integer compare;
+   every other keystroke of long input costs nothing here.  The
+   stand-in's exact width does not matter: 'x' and '\n' err by a
+   character, the next poll counts the real bytes, and a strip one
+   beat too tall is invisible. */
+static void pmPromptPreage_( char standin )
+{
+    if( gEntry == 0 || gMleLineH <= 0 || gGroup == 0 )
+        return;
+    if( gPromptLines >= pmPromptCap_() )
+        return;
+    static char text[ kEntryMaxChars + 2 ];
+    ULONG cb = 0;
+    if( !pmPromptPeek_( text, sizeof( text ) - 2, &cb ) )
+        return;
+    text[ cb ] = standin;
+    text[ cb + 1 ] = '\0';
+    RECTL er;
+    WinQueryWindowRect( gEntry, &er );
+    pmPromptSized_( text, (LONG) cb + 1, er.xRight - er.xLeft );
 }
 
 /* The prompt's keys, taken at the pump: deliverMessage is the one
@@ -1586,10 +1664,15 @@ static Boolean pmPromptKey_( const QMSG &q )
         if( ch == 0x0D )
             {
             if( ( flags & kKcShift ) != 0 )
+                {
+                pmPromptPreage_( '\n' );  // the line below needs room now
                 return True;    // the MLE's own newline, native and free
+                }
             pmPromptSubmitNow_();
             return False;
             }
+        if( ch >= 0x20 && ( ( flags & kKcCtrl ) == 0 ) )
+            pmPromptPreage_( 'x' );   // one character richer lands below
         return True;            // every other key: the control's affair
         }
     if( q.msg == kWmKeyDown && !gEntrySawChar )

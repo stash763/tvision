@@ -94,10 +94,13 @@ enum
     kCtlSetJudgeModel = 436,
     kCtlSetJudgeSec   = 437,
     kCtlSetCmdTimeout = 438,
+    kCtlSetPrompt     = 440,
     kCtlSetNoteWheel  = 441,
     kCtlSetNoteReq    = 442,
     kCtlSetNoteJudge  = 446,
     kCtlSetNoteCmd    = 448,
+    kCtlSetNotePrompt = 449,
+    kCtlSetLabelPrompt = 450,
 
     /* providers (904) */
     kCtlProvList      = 451,
@@ -398,6 +401,11 @@ MRESULT EXPENTRY pmSettingsDlgProc( HWND hwnd, ULONG msg,
         std::snprintf( t, sizeof( t ), "%ld to %ld, 0 = none",
                        gSet.commandMin, gSet.commandMax );
         WinSetDlgItemText( hwnd, kCtlSetNoteCmd, (PSZ) t );
+        std::snprintf( t, sizeof( t ), "%d", gSet.promptLines );
+        WinSetDlgItemText( hwnd, kCtlSetPrompt, (PSZ) t );
+        std::snprintf( t, sizeof( t ), "%d to %d",
+                       gSet.promptMin, gSet.promptMax );
+        WinSetDlgItemText( hwnd, kCtlSetNotePrompt, (PSZ) t );
 
         // The judging fields and their radio are the agent's, and a
         // build without one shows none of them -- absent fields change
@@ -427,6 +435,8 @@ MRESULT EXPENTRY pmSettingsDlgProc( HWND hwnd, ULONG msg,
                                                gSet.judgeSeconds );
             s.commandTimeout = fieldLong_( hwnd, kCtlSetCmdTimeout,
                                            gSet.commandTimeout );
+            s.promptLines = (int) fieldLong_( hwnd, kCtlSetPrompt,
+                                              gSet.promptLines );
             dlgText_( hwnd, kCtlSetJudgeModel, s.judgeModel,
                       sizeof( s.judgeModel ) );
             // A radio nobody checked (the hidden agent radio of a
