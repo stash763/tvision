@@ -108,6 +108,9 @@
    below instead and the name conflict never opens. */
 #define INCL_DOSPROCESS
 #define INCL_DOSERRORS
+#define INCL_DEV        // pmdev.h: DevQueryCaps and the CAPS_*_FONT_RES
+                        // pair -- the font-resolution questions a fixed-
+                        // font selection has to ask the display
 #define INCL_GPI
 #define INCL_WIN
 #define INCL_VIO        // bsesub.h:365 keeps the whole VIO section -- the
@@ -342,8 +345,10 @@ static int    gKeysOnPage   = 0;   // the kit's keysToPage counter
    came through (deliverMessage below), and it takes the prompt's
    Enter there.
      gEntryH1     one line's worth of strip, the birth formula's value;
-     gMleLineH    px per wrapped line, measured from the control's own
-                  font (GpiQueryFontMetrics on WinGetPS), lMaxBaselineExt;
+     gMleLineH    px per wrapped line -- the font's PITCH measured on
+                  the control's own PS (lMaxBaselineExt + lMaxDescender;
+                  budgeting the baseline extent alone clipped every
+                  line and let the control scroll);
      gMleDesc     the same font's descent (Watcom's name: lMaxDescender);
      gPromptHash  hash of the text as the last export saw it: change is
                   the only signal the growth engine needs;
@@ -1225,6 +1230,80 @@ typedef struct
     PVOID  pHWXCtlData;
     } AtuiMleCtlData;
 
+/* Fixed pitch for the prompt, on the user's ask -- and the arithmetic
+   agrees: a fixed font makes the width question one measurement can
+   answer exactly, and the MLE's kerning stops being a suspect for the
+   count that runs a line behind the control's own wrapping.  The
+   recipe is pmrexx's getfixedfont (pmrxsubs.c:261), the one font
+   choice in the toolkit that is made at startup rather than in a
+   dialog: enumerate the Courier family, keep the entry that matches
+   the display's font resolution -- 8 point if the box has one --
+   stamp it into an FATTRS with its lMatch, GpiCreateLogFont it, and
+   hand the FATTRS to MLM_SETFONT.  That last message's parameter
+   convention is proven three times over (sty_user.c:892,
+   mcispy.c:600, pmrexxio.c:599: all pass the address of an FATTRS),
+   and FATTRS itself is Watcom's own pmwin.h:214 -- nothing
+   transcribed.  pmrexx asks for bold; a prompt does not shout, so
+   fsSelection stays 0 = normal.  A box without Courier lands back
+   here with no change and says so in the log. */
+static void pmSetFixedFont_( HWND h )
+{
+    const HPS hps = WinGetPS( h );
+    if( hps == 0 )
+        return;
+    LONG resH = 0, resV = 0;
+    const HDC hdc = GpiQueryDevice( hps );
+    if( hdc != 0 )
+    {
+        DevQueryCaps( hdc, CAPS_HORIZONTAL_FONT_RES, 1L, &resH );
+        DevQueryCaps( hdc, CAPS_VERTICAL_FONT_RES, 1L, &resV );
+    }
+    static FONTMETRICS fm[ 200 ];   // one family's census, capped
+    LONG req = 0;
+    LONG n = GpiQueryFonts( hps, QF_PUBLIC, "Courier", &req, 0L, NULL );
+    if( n > 200 )
+        n = 200;
+    if( n > 0 )
+    {
+        req = n;
+        n = GpiQueryFonts( hps, QF_PUBLIC, "Courier", &req,
+                           (LONG) sizeof( fm ), fm );
+        if( n < 0 || n > 200 )
+            n = 0;
+    }
+    else
+        n = 0;
+    LONG lMatch = 0;
+    for( LONG i = 0; i < n && lMatch == 0; ++i )
+        if( fm[i].sNominalPointSize == 80
+            && fm[i].sXDeviceRes == (SHORT) resH
+            && fm[i].sYDeviceRes == (SHORT) resV )
+            lMatch = fm[i].lMatch;
+    if( lMatch == 0 )
+        for( LONG i = 0; i < n && lMatch == 0; ++i )
+            if( fm[i].sXDeviceRes == (SHORT) resH
+                && fm[i].sYDeviceRes == (SHORT) resV )
+                lMatch = fm[i].lMatch;
+    if( lMatch == 0 && n > 0 )
+        lMatch = fm[0].lMatch;      // the family is the guarantee;
+                                    // take what the box has
+    if( gLog != 0 )
+        fprintf( gLog, "entry font q=%ld res=%ldx%ld match=%ld\n",
+                 (long) n, (long) resH, (long) resV, (long) lMatch ),
+            fflush( gLog );
+    if( lMatch != 0 )
+    {
+        FATTRS fa;
+        memset( &fa, '\0', sizeof( fa ) );
+        fa.usRecordLength = (USHORT) sizeof( FATTRS );
+        fa.lMatch = lMatch;
+        strcpy( fa.szFacename, "Courier" );
+        GpiCreateLogFont( hps, NULL, 1L, &fa );
+        WinSendMsg( h, MLM_SETFONT, MPFROMP( &fa ), MPVOID );
+    }
+    WinReleasePS( hps );
+}
+
 /* Make the prompt: the wrapping variant the toolkit ships
    (MLS_WORDWRAP, sty_dlg.c:1703), the documented creation data
    above giving its format rectangle a real width from the first
@@ -1245,7 +1324,11 @@ static HWND pmCreateEntry( void )
     cd.iptCursor.lColumn = 0;
     RECTL gr;
     WinQueryWindowRect( gGroup, &gr );
-    cd.cxFormat = ( gr.xRight - gr.xLeft ) - 16;
+    cd.cxFormat = ( gr.xRight - gr.xLeft ) - 24;  // the same over-counted
+                                                  // gutter the line count
+                                                  // uses (MATCHWINDOW takes
+                                                  // it from the window after
+                                                  // the first layout anyway)
     if( cd.cxFormat < 64 )
         cd.cxFormat = 64;
     cd.cyFormat = gEntryH > 0 ? gEntryH : 24;
@@ -1266,24 +1349,36 @@ static HWND pmCreateEntry( void )
     if( gLog != 0 )
         fprintf( gLog, "entry limit %ld fit %ld\n", kEntryMaxChars, fit ),
             fflush( gLog );
+    pmSetFixedFont_( h );
     if( gMleLineH <= 0 )
         {
         const HPS hps = WinGetPS( h );
         FONTMETRICS fm;
+        LONG base = 0;
+        gMleDesc = 0;
         if( hps != 0 && GpiQueryFontMetrics( hps, (LONG) sizeof( fm ), &fm ) )
             {
-            gMleLineH = fm.lMaxBaselineExt;
-            gMleDesc  = fm.lMaxDescender;   // Watcom's name for the descent
+            base     = fm.lMaxBaselineExt;
+            gMleDesc = fm.lMaxDescender;   // Watcom's name for the descent
             }
         if( hps != 0 )
             WinReleasePS( hps );
-        if( gMleLineH < 8 )
-            gMleLineH = 16;   // a floor, not a measurement: never zero
-        if( gMleDesc < 0 || gMleDesc > gMleLineH / 3 )
+        if( base < 6 )
+            base = 13;        // a floor, not a measurement: never zero
+        if( gMleDesc < 0 || gMleDesc > base )
             gMleDesc = 3;     // plausible-range guard: a descent is a sliver
+        /* The pitch is the whole of a line's vertical budget: the
+           baseline extent AND the descent.  Budgeting lMaxBaselineExt
+           alone made every additional line five pixels short on this
+           box's font (20 asked of 20+5) -- the caret landed in the
+           clipped sliver and the control scrolled, which is the
+           "first line scrolls up" the user reported two sessions
+           running while the growth log looked healthy. */
+        gMleLineH = base + gMleDesc;
         if( gLog != 0 )
-            fprintf( gLog, "entry lineh %ld desc %ld\n",
-                     (long) gMleLineH, (long) gMleDesc ), fflush( gLog );
+            fprintf( gLog, "entry pitch %ld base %ld desc %ld\n",
+                     (long) gMleLineH, (long) base, (long) gMleDesc ),
+                fflush( gLog );
         }
     /* The birth probe, toolkit calls only: insert, query, export the
        exact count, delete.  The numbers land next to the first line
@@ -1339,7 +1434,10 @@ static LONG pmPromptLines_( const char *text, LONG len, LONG width )
 {
     if( len <= 0 )
         return 1;
-    LONG avail = width - 16;   // the border and the MLE's margins, over-counted
+    LONG avail = width - 24;   // border, the MLE's margins, caret room --
+                               // over-counted on purpose: a count that
+                               // errs tall grows early, one that errs
+                               // short scrolls
     if( avail < 48 )
         avail = 48;
     const HPS hps = WinGetPS( gEntry );
@@ -1420,7 +1518,7 @@ static void pmPromptGrow_( LONG lines )
                 - (LONG) kMinRows * (LONG) gCellPxH;
     if( maxH < gEntryH1 )
         maxH = gEntryH1;
-    LONG want = gEntryH1 + ( lines - 1 ) * gMleLineH;
+    LONG want = gEntryH1 + ( lines - 1 ) * gMleLineH + 4;
     if( want > maxH )
         want = maxH;
     if( want < gEntryH1 )
