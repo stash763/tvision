@@ -1172,30 +1172,74 @@ static void pmSnapSWP( HWND hwndFrame, PSWP pswp )
     pswp->cy = newCy;
 }
 
-/* Make the prompt the way the toolkit's own wrapping MLE is made --
-   and now the comparison is no longer fragmentary: every MLM call in
-   the pm/controls sample has been inventoried, and none of them is a
-   format-rectangle message, a wrap message, or a control-data
-   structure.  The wrapping variant (sty_dlg.c:1703) is created
-   WS_VISIBLE|MLS_WORDWRAP at 0,0,0,0 with control data NULL and it
-   ships working; the scrolling editor variant (sty_init.c:147) is
-   MLS_HSCROLL|MLS_VSCROLL, which is the same control asked NOT to
-   wrap.  The MLECTLDATA this file passed at the two previous births
-   -- 0x0 format rectangle the first time, measured dimensions the
-   second -- was the only home-invention left on the prompt, and both
-   those births wrapped nothing.  Text limit stays a plain
-   MLM_SETTEXTLIMIT after birth; the sample never needs one, the 4k
-   promise is ours, and a LONG-argument message has no convention to
-   get wrong. */
+/* The MLE's documented creation data (the WinCreateWindow class
+   reference names MLECTLDATA for it; IBM's layout is pmmle.h:70,
+   transcribed because Watcom's IPT is a bare LONG where IBM's is a
+   pair -- pmwin.h:1870 -- and the wrong shape scatters every field
+   past iptCursor).  It carries the one thing that decides where
+   text breaks: the format rectangle.  Screenshot10.jpg is the proof
+   of what a rectangle-less birth does: born into a 0x0 window, the
+   control wraps every few characters into a scrolled column --
+   complete with its own little vertical scrollbar -- and every line
+   above the caret vanishes.  And the earlier no-wrap report is
+   exonerated in the same breath: THAT birth had a real rectangle;
+   its only failure was the export that never grew the strip, so
+   nothing visible could say wrapping had happened.
+   MLFFMTRECT_MATCHWINDOW keeps the rectangle following the window
+   through every tile. */
+typedef struct
+    {
+    LONG lLine;
+    LONG lColumn;
+    } AtuiIpt;
+typedef struct
+    {
+    USHORT cbCtlData;
+    USHORT afIEFormat;
+    ULONG  cchText;
+    AtuiIpt iptAnchor;
+    AtuiIpt iptCursor;
+    LONG   cxFormat;
+    LONG   cyFormat;
+    ULONG  afFormatFlags;
+    PVOID  pHWXCtlData;
+    } AtuiMleCtlData;
+
+/* Make the prompt: the wrapping variant the toolkit ships
+   (MLS_WORDWRAP, sty_dlg.c:1703), the documented creation data
+   above giving its format rectangle a real width from the first
+   layout, and the sample's own colors applied after birth
+   (sty_init.c:159: CLR_BLACK on CLR_WHITE -- the MLE's defaults are
+   a black box, which the user has now seen).  Text limit stays a
+   plain LONG message; reading stays the exact-count export pair;
+   clearing stays mcispy's MLM_DELETE range. */
 static HWND pmCreateEntry( void )
 {
+    AtuiMleCtlData cd;
+    cd.cbCtlData = (USHORT) sizeof( cd );
+    cd.afIEFormat = MLFIE_CFTEXT;         // plain text; CR/LF newlines
+    cd.cchText = (ULONG) kEntryMaxChars;  // the 4k, from the first byte
+    cd.iptAnchor.lLine = 0;
+    cd.iptAnchor.lColumn = 0;
+    cd.iptCursor.lLine = 0;
+    cd.iptCursor.lColumn = 0;
+    RECTL gr;
+    WinQueryWindowRect( gGroup, &gr );
+    cd.cxFormat = ( gr.xRight - gr.xLeft ) - 16;
+    if( cd.cxFormat < 64 )
+        cd.cxFormat = 64;
+    cd.cyFormat = gEntryH > 0 ? gEntryH : 24;
+    cd.afFormatFlags = MLFFMTRECT_MATCHWINDOW;
+    cd.pHWXCtlData = 0;
     const HWND h = WinCreateWindow( gGroup, WC_MLE, "",
                                     WS_VISIBLE | WS_TABSTOP | MLS_WORDWRAP
                                       | MLS_BORDER,
                                     0, 0, 0, 0, gGroup, HWND_TOP,
-                                    0, NULL, NULL );
+                                    0, &cd, NULL );
     if( h == 0 )
         return 0;
+    WinSendMsg( h, MLM_SETTEXTCOLOR, MPFROMLONG( CLR_BLACK ), MPVOID );
+    WinSendMsg( h, MLM_SETBACKCOLOR, MPFROMLONG( CLR_WHITE ), MPVOID );
     const LONG fit = (LONG) WinSendMsg( h, MLM_SETTEXTLIMIT,
                                         MPFROMLONG( kEntryMaxChars ),
                                         MPVOID );
