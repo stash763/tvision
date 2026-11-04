@@ -408,6 +408,7 @@ void pmTranscriptPage( int direction );
 void pmToggleThinking( void );
 int  pmKitPromptLines( void );
 int  pmKitWindowAttr( void );
+void pmKitStatusRefresh( void );
 }
 static Boolean gAvioOk   = False;
 static Boolean gPmUp    = False; // window + queue exist; drawing is legal
@@ -1340,10 +1341,14 @@ static void pmSetFixedFont_( HWND h )
 static const ULONG kAtuiFgPal[ 16 ] =
     {
     0x000000, 0x0000A8, 0x00A800, 0x00A8A8,
-    0xA80000, 0xA800A8, 0xA85400, 0xA8A8A8,
+    0xA80000, 0xA800A8, 0xA85400, 0xFFFFFF,
     0x545454, 0x5454FC, 0x50FC00, 0x54FCFC,
     0xFC5454, 0xFC54FC, 0xFCFC54, 0xFFFFFF
     };
+    /* Index 7 white, not the VGA table's light gray: measured against
+       the page (screenshot11), the engine draws attribute-7 text white
+       and the 0xA8A8A8 prompt read as dim beside it (user: "should be
+       white to match the theme in the response area"). */
 static const ULONG kAtuiBgPal[ 16 ] =
     {
     0x000000, 0x0000A8, 0x00A800, 0x00A8A8,
@@ -1877,13 +1882,42 @@ static ULONG pmUnCrlf_( char *p, ULONG n )
 static void pmPromptSubmitNow_( void )
 {
     pmPromptRead_();
+    /* MLM_DELETE counts in the query's currency -- one character per
+       paragraph break -- and on this box an over-run count deletes
+       nothing at all rather than everything: the 1:34a log shows the
+       text alive after the delete, the query and export frozen
+       behind it, and the next Enter submitting the same four
+       characters again.  pmrexx clears an MLE with the exact size
+       (pmrexx.c:837); the exact size measured from the raw bytes is
+       the byte count less one for every CR/LF pair. */
+    ULONG chars = 0;
+    for( ULONG i = 0; i < gMleCb; ++i )
+        if( ! ( gMleBuf[ i ] == '\r' && i + 1 < gMleCb
+                && gMleBuf[ i + 1 ] == '\n' ) )
+            ++chars;
     ULONG cb = pmUnCrlf_( gMleBuf, gMleCb );
     if( cb == 0 )
         return;                        // silence is not submitted
     if( gLog != 0 )
         fprintf( gLog, "entry submit len=%lu\n", (unsigned long) cb ),
             fflush( gLog );
-    WinSendMsg( gEntry, MLM_DELETE, MPFROMLONG( 0 ), MPFROMLONG( 65536 ) );
+    if( chars > 0 )
+        {
+        const MRESULT dr = WinSendMsg( gEntry, MLM_DELETE,
+                                       MPFROMLONG( 0 ),
+                                       MPFROMLONG( chars ) );
+        if( dr != 0 && gLog != 0 )
+            {
+            static int sDelLogs = 0;
+            if( sDelLogs < 4 )
+                {
+                ++sDelLogs;
+                fprintf( gLog, "clear failed r=%x chars=%lu\n",
+                         (unsigned) (ULONG) dr,
+                         (unsigned long) chars ), fflush( gLog );
+                }
+            }
+        }
     gPromptHash = pmHash_( "", 0 );
     gPromptLen = 0;
     gPromptSaw = 0;
@@ -1965,6 +1999,12 @@ static void pmPromptPreage_( char standin )
     RECTL er;
     WinQueryWindowRect( gEntry, &er );
     pmPromptSized_( gMleBuf, (LONG) gMleCb + 1, er.xRight - er.xLeft );
+    gPromptLen = (LONG) gMleCb;  // back to truth: the stand-in was for
+                                 // the count only -- leaving it in the
+                                 // length made the next honest read a
+                                 // byte short of expectation, an
+                                 // easy false alarm for the empty-read
+                                 // witness (log: empty read at len 1)
 }
 
 /* The prompt's keys, taken at the pump: deliverMessage is the one
@@ -2222,6 +2262,13 @@ static MRESULT EXPENTRY pmGroupProc( HWND hwnd, ULONG msg,
         }
 }
 
+/* The strip's one sentence, kept here rather than in PM's window-text
+   store: the paint reads this buffer, pmStatusKit writes it, and no
+   window-manager storage semantics sit between the two.  (The 1:34a
+   session proved the middleman was one too many: the band showed its
+   birth word long after the app had pushed the provider status.) */
+static char gStatusText[ 256 ] = "atui";
+
 /* The status strip: not a button, not a control -- a band of the
    theme's two colors along the floor of the window with a sentence of
    text in it, which is what a status bar has always been.  (It used
@@ -2254,16 +2301,12 @@ static MRESULT EXPENTRY pmStatusProc( HWND hwnd, ULONG msg,
             RECTL r;
             WinQueryWindowRect( hwnd, &r );
             WinFillRect( hdc, &r, (LONG) gChromeBg );
-            char text[ 256 ];
-            const LONG cch =
-                WinQueryWindowText( hwnd, (ULONG) sizeof( text ) - 1,
-                                    (PSZ) text );
+            const size_t cch = strlen( gStatusText );
             if( cch > 0 )
                 {
-                text[ cch ] = '\0';
                 RECTL tr = r;
                 tr.xLeft += 6;   // the margin PM's own controls wear
-                WinDrawText( hdc, cch, (PCH) text, &tr,
+                WinDrawText( hdc, (LONG) cch, (PCH) gStatusText, &tr,
                              (LONG) gChromeFg, (LONG) gChromeBg,
                              DT_LEFT | DT_VCENTER );
                 }
@@ -3054,6 +3097,11 @@ static void pmOpenWindow()
     // (src/tui/pmdialogs.h), before the first paint and before any event
     // that could open one.
     pmDialogsInstall();
+    // ...and ask for its words right away: the desktop built its status
+    // text before any window existed to carry it (the application object
+    // is constructed before the screen), and without this fetch the band
+    // would say only its birth word forever.
+    pmKitStatusRefresh();
 
     /* The page -- a child of the group, and the window everything else
        in this driver already believes gClient to be: the DC opens on it,
@@ -3260,7 +3308,16 @@ extern "C" void pmStatusKit( const char *text )
 {
     if( gStatusBar != 0 && text != 0 )
         {
-        WinSetWindowText( gStatusBar, (PSZ) text );
+        static int sPushLogs = 0;
+        if( gLog != 0 && sPushLogs < 8 )
+            {
+            ++sPushLogs;
+            fprintf( gLog, "status push len=%u\n",
+                     (unsigned) strlen( text ) ), fflush( gLog );
+            }
+        strncpy( gStatusText, text, sizeof( gStatusText ) - 1 );
+        gStatusText[ sizeof( gStatusText ) - 1 ] = '\0';
+        WinSetWindowText( gStatusBar, (PSZ) gStatusText );
         WinInvalidateRect( gStatusBar, NULL, False );
         }
 }
@@ -3472,7 +3529,22 @@ void THardwareInfo::flushScreen() noexcept
     if( gDirtyCount == 0 )
         return;
     if( gHvps == 0 || gShadowCols != gCols || gShadowRows != gRows )
-        return;                 // nowhere to push; the shadow keeps the news
+        {
+        /* Silence here is what a frozen screen looks like from the
+           inside: the frame's news stays in the shadow forever.  If
+           the whole session refuses, say so four times, with the
+           two sizes that disagree. */
+        static int sRefuseLogs = 0;
+        if( gLog != 0 && sRefuseLogs < 4 )
+            {
+            ++sRefuseLogs;
+            fprintf( gLog, "flush refuse sh %ux%u grid %ux%u hvps=%d\n",
+                     (unsigned) gShadowCols, (unsigned) gShadowRows,
+                     (unsigned) gCols, (unsigned) gRows, (int)(gHvps != 0) ),
+                    fflush( gLog );
+            }
+        return;
+        }
     /* The caret goes away for the duration of the push and comes back
        after it.  PM's caret is an inversion laid over the screen, and a
        write that lands under it without hiding leaves the inverted pixels
@@ -3492,6 +3564,17 @@ void THardwareInfo::flushScreen() noexcept
     forgetPending();
     if( caretWasShown )
         WinShowCursor( gClient, TRUE );
+    /* And show it, in the pair every AVIO writer keeps: VioWrtCellStr
+       fills the associated buffer, VioShowBuf tells the window.
+       Without this half the screen freezes exactly as the 2026-11-04
+       log measured it: submits processed, transcript appended, cells
+       pushed, and not one pixel arriving until some window event
+       happened to deliver a WM_PAINT on its own.  eFTE shows after
+       every writing burst; the whole page is the honest area, the
+       same one WM_PAINT shows. */
+    VioShowBuf( 0, (USHORT) ( 2u * (unsigned long) gCols
+                               * (unsigned long) gRows ),
+                (HVIO) gHvps );
 }
 
 void THardwareInfo::redrawScreen() noexcept
@@ -3626,7 +3709,9 @@ void THardwareInfo::waitForEvents( int timeoutMs ) noexcept
     ++gWaitCalls;
     if( ( gWaitCalls <= 6 || gWaitCalls % 512 == 0 ) && gLog != 0 )
         {
-        fprintf( gLog, "wait #%ld t=%d\n", gWaitCalls, timeoutMs );
+        fprintf( gLog, "wait #%ld t=%d dirty=%u runs=%lu\n",
+                 gWaitCalls, timeoutMs, (unsigned) gDirtyCount,
+                 (unsigned long) gPmRuns );
         fflush( gLog );
         }
     flushScreen();
