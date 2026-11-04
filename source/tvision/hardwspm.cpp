@@ -2347,9 +2347,26 @@ static MRESULT EXPENTRY pmStatusProc( HWND hwnd, ULONG msg,
                 {
                 RECTL tr = r;
                 tr.xLeft += 6;   // the margin PM's own controls wear
-                WinDrawText( hdc, (LONG) cch, (PCH) gStatusText, &tr,
-                             (LONG) gChromeFg, (LONG) gChromeBg,
-                             DT_LEFT | DT_VCENTER );
+                const LONG drawn =
+                    WinDrawText( hdc, (LONG) cch, (PCH) gStatusText, &tr,
+                                 (LONG) gChromeFg, (LONG) gChromeBg,
+                                 DT_LEFT | DT_VCENTER );
+                /* EDM: returns 0 with an error, and its colors have
+                   been documented as both "color" and "index" --
+                   which of the failures this silent one was, the
+                   error code answers: PMERR_INVALID_FLAG indicts the
+                   flags, PMERR_INVALID_COLOR indicts the RGB values,
+                   a positive count means the glyphs are on their way
+                   and the mystery is elsewhere. */
+                static int sDrawLogs = 0;
+                if( gLog != 0 && sDrawLogs < 3 )
+                    {
+                    ++sDrawLogs;
+                    fprintf( gLog, "status draw n=%ld err=%x fg=%lx bg=%lx\n",
+                             drawn, (unsigned) WinGetLastError( gHab ),
+                             (unsigned long) gChromeFg,
+                             (unsigned long) gChromeBg ), fflush( gLog );
+                    }
                 }
             WinEndPaint( hdc );
             }
