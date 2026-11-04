@@ -2211,6 +2211,29 @@ static MRESULT EXPENTRY pmGroupProc( HWND hwnd, ULONG msg,
         if( gClient != 0 && pageH > 0 )
             WinSetWindowPos( gClient, 0, 0, gStatusH + entryH, w, pageH,
                              SWP_SIZE | SWP_MOVE | SWP_SHOW );
+        /* The resize artifact the user saw (screenshot13: a ghost of
+           the status text riding in the entry strip after a drag)
+           lives somewhere in this tiling; ask where the three
+           children ended up for the first tilings of a session. */
+        static int sTileLogs = 0;
+        if( gLog != 0 && sTileLogs < 6 )
+            {
+            ++sTileLogs;
+            RECTL sr, er2, pr;
+            if( gStatusBar != 0 ) WinQueryWindowRect( gStatusBar, &sr );
+            else sr.xLeft = sr.yBottom = sr.xRight = sr.yTop = -1;
+            if( gEntry != 0 ) WinQueryWindowRect( gEntry, &er2 );
+            else er2.xLeft = er2.yBottom = er2.xRight = er2.yTop = -1;
+            if( gClient != 0 ) WinQueryWindowRect( gClient, &pr );
+            else pr.xLeft = pr.yBottom = pr.xRight = pr.yTop = -1;
+            fprintf( gLog,
+                     "tile st(%ld,%ld-%ld,%ld) en(%ld,%ld-%ld,%ld) "
+                     "pg(%ld,%ld-%ld,%ld)\n",
+                     sr.xLeft, sr.yBottom, sr.xRight, sr.yTop,
+                     er2.xLeft, er2.yBottom, er2.xRight, er2.yTop,
+                     pr.xLeft, pr.yBottom, pr.xRight, pr.yTop ),
+                     fflush( gLog );
+            }
         return 0;
         }
 
@@ -2329,7 +2352,7 @@ static MRESULT EXPENTRY pmStatusProc( HWND hwnd, ULONG msg,
             WinFillRect( hdc, &r, (LONG) gChromeBg );
             const size_t cch = strlen( gStatusText );
             static int sPaintLogs = 0;
-            if( gLog != 0 && sPaintLogs < 3 )
+            if( gLog != 0 && sPaintLogs < 8 )
                 {
                 ++sPaintLogs;
                 fprintf( gLog, "status paint %ldx%ld cch=%u\n",
@@ -2364,7 +2387,7 @@ static MRESULT EXPENTRY pmStatusProc( HWND hwnd, ULONG msg,
                                  0L, 0L,
                                  DT_LEFT | DT_VCENTER | DT_TEXTATTRS );
                 static int sDrawLogs = 0;
-                if( gLog != 0 && sDrawLogs < 3 )
+                if( gLog != 0 && sDrawLogs < 8 )
                     {
                     ++sDrawLogs;
                     fprintf( gLog,
