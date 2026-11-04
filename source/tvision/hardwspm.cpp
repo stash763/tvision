@@ -1234,18 +1234,19 @@ typedef struct
    agrees: a fixed font makes the width question one measurement can
    answer exactly, and the MLE's kerning stops being a suspect for the
    count that runs a line behind the control's own wrapping.  The
-   recipe is pmrexx's getfixedfont (pmrxsubs.c:261), the one font
-   choice in the toolkit that is made at startup rather than in a
-   dialog: enumerate the Courier family, keep the entry that matches
-   the display's font resolution -- 8 point if the box has one --
-   stamp it into an FATTRS with its lMatch, GpiCreateLogFont it, and
-   hand the FATTRS to MLM_SETFONT.  That last message's parameter
-   convention is proven three times over (sty_user.c:892,
-   mcispy.c:600, pmrexxio.c:599: all pass the address of an FATTRS),
-   and FATTRS itself is Watcom's own pmwin.h:214 -- nothing
-   transcribed.  pmrexx asks for bold; a prompt does not shout, so
-   fsSelection stays 0 = normal.  A box without Courier lands back
-   here with no change and says so in the log. */
+   first attempt asked for "Courier" by name, pmrexx's getfixedfont
+   recipe (pmrxsubs.c:261), and the box answered `entry font q=0`:
+   this eComStation has no Courier at all.  So the ask goes the way
+   of the box instead: enumerate the public fonts, keep the ones
+   whose fsDefn carries FM_TYPE_FIXED (Watcom's os2def.h:0x0001 --
+   the bit, not pmrexx's inverted ==0 test, which its family query
+   was papering over), at the display's own font resolution, and take
+   the smallest at or near 8 point.  The recipe's shape -- lMatch and
+   szFacename into an FATTRS, GpiCreateLogFont, MLM_SETFONT with the
+   FATTRS address -- is the samples' own (sty_user.c:892, mcispy.c:600,
+   pmrexxio.c:599), and FATTRS is Watcom's pmwin.h:214: nothing
+   transcribed.  The chosen family lands in the log, and a box with
+   no fixed font at all is a logged no-op. */
 static void pmSetFixedFont_( HWND h )
 {
     const HPS hps = WinGetPS( h );
@@ -1258,46 +1259,51 @@ static void pmSetFixedFont_( HWND h )
         DevQueryCaps( hdc, CAPS_HORIZONTAL_FONT_RES, 1L, &resH );
         DevQueryCaps( hdc, CAPS_VERTICAL_FONT_RES, 1L, &resV );
     }
-    static FONTMETRICS fm[ 200 ];   // one family's census, capped
+    static FONTMETRICS fm[ 400 ];   // the system's census, capped
     LONG req = 0;
-    LONG n = GpiQueryFonts( hps, QF_PUBLIC, "Courier", &req, 0L, NULL );
-    if( n > 200 )
-        n = 200;
+    LONG n = GpiQueryFonts( hps, QF_PUBLIC, NULL, &req, 0L, NULL );
+    if( n > 400 )
+        n = 400;
     if( n > 0 )
     {
         req = n;
-        n = GpiQueryFonts( hps, QF_PUBLIC, "Courier", &req,
+        n = GpiQueryFonts( hps, QF_PUBLIC, NULL, &req,
                            (LONG) sizeof( fm ), fm );
-        if( n < 0 || n > 200 )
+        if( n < 0 || n > 400 )
             n = 0;
     }
     else
         n = 0;
-    LONG lMatch = 0;
-    for( LONG i = 0; i < n && lMatch == 0; ++i )
-        if( fm[i].sNominalPointSize == 80
-            && fm[i].sXDeviceRes == (SHORT) resH
-            && fm[i].sYDeviceRes == (SHORT) resV )
-            lMatch = fm[i].lMatch;
-    if( lMatch == 0 )
-        for( LONG i = 0; i < n && lMatch == 0; ++i )
-            if( fm[i].sXDeviceRes == (SHORT) resH
-                && fm[i].sYDeviceRes == (SHORT) resV )
-                lMatch = fm[i].lMatch;
-    if( lMatch == 0 && n > 0 )
-        lMatch = fm[0].lMatch;      // the family is the guarantee;
-                                    // take what the box has
+    LONG pick = -1;
+    for( LONG i = 0; i < n; ++i )
+    {
+        if( ( fm[i].fsDefn & FM_TYPE_FIXED ) == 0 )
+            continue;
+        if( fm[i].sXDeviceRes != (SHORT) resH
+            || fm[i].sYDeviceRes != (SHORT) resV )
+            continue;
+        const SHORT s = fm[i].sNominalPointSize;
+        const SHORT p = ( pick < 0 ) ? 0 : fm[ pick ].sNominalPointSize;
+        if( pick < 0
+            || ( s >= 80 && p < 80 )
+            || ( ( s >= 80 ) == ( p >= 80 ) && s < p ) )
+            pick = i;
+    }
     if( gLog != 0 )
-        fprintf( gLog, "entry font q=%ld res=%ldx%ld match=%ld\n",
-                 (long) n, (long) resH, (long) resV, (long) lMatch ),
-            fflush( gLog );
-    if( lMatch != 0 )
+        fprintf( gLog, "entry font q=%ld res=%ldx%ld pick=%ld%s%s\n",
+                 (long) n, (long) resH, (long) resV, (long) pick,
+                 ( pick >= 0 ) ? " " : "",
+                 ( pick >= 0 ) ? fm[ pick ].szFacename : "" ),
+                fflush( gLog );
+    if( pick >= 0 )
     {
         FATTRS fa;
         memset( &fa, '\0', sizeof( fa ) );
         fa.usRecordLength = (USHORT) sizeof( FATTRS );
-        fa.lMatch = lMatch;
-        strcpy( fa.szFacename, "Courier" );
+        fa.lMatch = fm[ pick ].lMatch;
+        strcpy( fa.szFacename, fm[ pick ].szFacename );
+        fa.idRegistry = fm[ pick ].idRegistry;
+        fa.usCodePage = fm[ pick ].usCodePage;
         GpiCreateLogFont( hps, NULL, 1L, &fa );
         WinSendMsg( h, MLM_SETFONT, MPFROMP( &fa ), MPVOID );
     }
@@ -1367,18 +1373,34 @@ static HWND pmCreateEntry( void )
             base = 13;        // a floor, not a measurement: never zero
         if( gMleDesc < 0 || gMleDesc > base )
             gMleDesc = 3;     // plausible-range guard: a descent is a sliver
-        /* The pitch is the whole of a line's vertical budget: the
-           baseline extent AND the descent.  Budgeting lMaxBaselineExt
-           alone made every additional line five pixels short on this
-           box's font (20 asked of 20+5) -- the caret landed in the
-           clipped sliver and the control scrolled, which is the
-           "first line scrolls up" the user reported two sessions
-           running while the growth log looked healthy. */
-        gMleLineH = base + gMleDesc;
-        if( gLog != 0 )
-            fprintf( gLog, "entry pitch %ld base %ld desc %ld\n",
-                     (long) gMleLineH, (long) base, (long) gMleDesc ),
-                fflush( gLog );
+        /* The pitch, as the box taught us in two sessions: budgeting
+           lMaxBaselineExt alone scrolled (the MLE's vertical margins
+           ate the last sliver -- session one) and budgeting it PLUS
+           the descent left a blank line every five (session two:
+           "7 lines of text, 2 blank lines below").  The control
+           draws a line's advance at the baseline extent; what it
+           really wanted was a few pixels of total slack for its
+           margins, which pmPromptGrow_ adds once.  The descent stays
+           measured for the log; the width probe (a fixed font's "i"
+           and "W" answer equal) is the birth proof of the font
+           choice, told by the same handles the counting uses. */
+        gMleLineH = base;
+        {
+            const HPS hm = WinGetPS( h );
+            LONG wi = 0, ww = 0;
+            if( hm != 0 )
+                {
+                wi = (LONG) GpiQueryTabbedTextExtent( hm, 1, (PCH) "i",
+                                                      0, NULL );
+                ww = (LONG) GpiQueryTabbedTextExtent( hm, 1, (PCH) "W",
+                                                      0, NULL );
+                WinReleasePS( hm );
+                }
+            if( gLog != 0 )
+                fprintf( gLog, "entry pitch %ld base %ld desc %ld w i=%ld W=%ld\n",
+                         (long) gMleLineH, (long) base, (long) gMleDesc,
+                         wi, ww ), fflush( gLog );
+        }
         }
     /* The birth probe, toolkit calls only: insert, query, export the
        exact count, delete.  The numbers land next to the first line
@@ -1518,7 +1540,7 @@ static void pmPromptGrow_( LONG lines )
                 - (LONG) kMinRows * (LONG) gCellPxH;
     if( maxH < gEntryH1 )
         maxH = gEntryH1;
-    LONG want = gEntryH1 + ( lines - 1 ) * gMleLineH + 4;
+    LONG want = gEntryH1 + ( lines - 1 ) * gMleLineH + 8;
     if( want > maxH )
         want = maxH;
     if( want < gEntryH1 )
@@ -1818,8 +1840,21 @@ static Boolean pmPromptKey_( const QMSG &q )
             {
             if( ( flags & kKcShift ) != 0 )
                 {
-                pmPromptPreage_( '\n' );  // the line below needs room now
-                return True;    // the MLE's own newline, native and free
+                /* The newline, inserted by our own hand: this box's
+                   WM_CHAR carried Enter's character with the Shift
+                   flag to the pump, and dispatching it on left the
+                   text unchanged -- the MLE's default command table
+                   answers the shifted Enter with nothing.  MLM_INSERT
+                   is the message this box has answered since the
+                   birth probe, and the CR/LF pair is what the
+                   control itself stores for a hard break (the
+                   pmUnCrlf_ pass knows the shape).  Room first,
+                   character after: the tense the growth engine
+                   learned. */
+                pmPromptPreage_( '\n' );
+                WinSendMsg( gEntry, MLM_INSERT, MPFROMP( "\r\n" ),
+                            MPVOID );
+                return False;       // ours now: never reach the table
                 }
             pmPromptSubmitNow_();
             return False;
