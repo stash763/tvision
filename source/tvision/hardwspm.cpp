@@ -1262,17 +1262,27 @@ static void pmSetFixedFont_( HWND h )
     static FONTMETRICS fm[ 400 ];   // the system's census, capped
     LONG req = 0;
     LONG n = GpiQueryFonts( hps, QF_PUBLIC, NULL, &req, 0L, NULL );
-    if( n > 400 )
-        n = 400;
-    if( n > 0 )
-    {
+    if( n <= 0 )
+        {
+        /* NULL asked for nothing this box would answer; the empty
+           string is the enumeration idiom the GPI records use for
+           "everything". */
+        req = 0;
+        n = GpiQueryFonts( hps, QF_PUBLIC, "", &req, 0L, NULL );
+        if( n > 0 )
+            {
+            req = n;
+            n = GpiQueryFonts( hps, QF_PUBLIC, "", &req,
+                               (LONG) sizeof( fm ), fm );
+            }
+        }
+    else
+        {
         req = n;
         n = GpiQueryFonts( hps, QF_PUBLIC, NULL, &req,
                            (LONG) sizeof( fm ), fm );
-        if( n < 0 || n > 400 )
-            n = 0;
-    }
-    else
+        }
+    if( n < 0 || n > 400 )
         n = 0;
     LONG pick = -1;
     for( LONG i = 0; i < n; ++i )
@@ -1464,7 +1474,12 @@ static LONG pmPromptLines_( const char *text, LONG len, LONG width )
         avail = 48;
     const HPS hps = WinGetPS( gEntry );
     if( hps == 0 )
-        return 1;              // cannot measure: move nothing
+        return 0;              // cannot measure: 0 = no answer, not one
+                               // line -- the engine treats a missing
+                               // measurement as silence after the
+                               // 2026-11-03 collapse, where two failed
+                               // measurements in a window read as
+                               // "one line" and folded the strip
     const LONG spw = (LONG) GpiQueryTabbedTextExtent( hps, 1, (PCH) " ",
                                                       0, NULL );
     LONG total = 0;
@@ -1502,7 +1517,7 @@ static LONG pmPromptLines_( const char *text, LONG len, LONG width )
             ++a;               // a CR/LF pair is one break, not two
         }
     WinReleasePS( hps );
-    return total > 0 ? total : 1;
+    return total > 0 ? total : 0;
 }
 
 /* The configurable height cap of the strip (Options > Settings): it
@@ -1568,36 +1583,58 @@ static void pmPromptGrow_( LONG lines )
    equal smaller counts shrink the strip, so a real backspace still
    lands within a poll-and-a-half (~160 ms, invisible) while a lone
    lie never does. */
+static LONG gPromptSawRun = 0;    // consecutive readings of gPromptSaw
+
 static void pmPromptApply_( LONG lines )
 {
-    if( lines < gPromptLines && lines != gPromptSaw )
+    if( lines < gPromptLines )
     {
-        static int sHoldLogs = 0;
-        if( gLog != 0 && sHoldLogs < 8 )
+        if( lines != gPromptSaw )
             {
-            ++sHoldLogs;
-            fprintf( gLog, "prompt hold %ld saw %ld\n",
-                     (long) gPromptLines, (long) lines ), fflush( gLog );
+            static int sHoldLogs = 0;
+            if( gLog != 0 && sHoldLogs < 24 )
+                {
+                ++sHoldLogs;
+                fprintf( gLog, "prompt hold %ld saw %ld\n",
+                         (long) gPromptLines, (long) lines ),
+                        fflush( gLog );
+                }
+            gPromptSaw = lines;
+            gPromptSawRun = 1;
+            return;
             }
-        gPromptSaw = lines;
-        return;
+        ++gPromptSawRun;
+        /* An ordinary shrink lands on its second witness; a collapse
+           to a one-line strip of a multi-line prompt needs a third.
+           The 2026-11-03 collapse (8 lines, two reads, strip folded,
+           text intact and read back 8 the next beat) was exactly
+           two-in-a-row deep -- whatever lied, three consecutive
+           agreements is a fact worth acting on. */
+        const LONG need = ( lines <= 1 && gPromptLines >= 3 ) ? 3 : 2;
+        if( gPromptSawRun < need )
+            return;
     }
     gPromptSaw = 0;
+    gPromptSawRun = 0;
     gPromptLines = lines;
     pmPromptGrow_( lines );
 }
 
 /* The one sizing step both hands share: count the given text over the
-   given width and apply the count.  The poll runs this on what the
-   text is; the keystroke path (below) runs it on what the text is
-   about to become, which is the whole of the no-scroll promise: the
-   strip is one line taller before the character that wraps lands, so
-   the control never has a caret in content with no room and never
-   scrolls away from line one. */
+   given width and apply the count.  A count of zero means the
+   measurement could not be taken, and the strip hears nothing at
+   all: no news is truer than a fake line number.  The poll runs this
+   on what the text is; the keystroke path (below) runs it on what
+   the text is about to become, which is the whole of the no-scroll
+   promise: the strip is one line taller before the character that
+   wraps lands, so the control never has a caret in content with no
+   room and never scrolls away from line one. */
 static void pmPromptSized_( const char *text, LONG n, LONG width )
 {
     gPromptLen = n;
-    pmPromptApply_( pmPromptLines_( text, n, width ) );
+    const LONG lines = pmPromptLines_( text, n, width );
+    if( lines > 0 )
+        pmPromptApply_( lines );
 }
 
 /* A read: query the length (sty_file.c:475), export exactly that many
@@ -1621,13 +1658,16 @@ static Boolean pmPromptRead_( void )
     if( n > (ULONG) kEntryMaxChars )
         n = (ULONG) kEntryMaxChars;
     ULONG got = 0;
+    ULONG cb = 0;
+    LONG exp = 0;
     if( n > 0 )
     {
         ULONG off = 0;
-        ULONG cb = n;
+        cb = n;
         const MRESULT r = WinSendMsg( gEntry, MLM_EXPORT, MPFROMP( &off ),
                                       MPFROMLONG( &cb ) );
-        got = (ULONG) (LONG) r;
+        exp = (LONG) r;
+        got = (ULONG) exp;
         if( got == 0 )
             got = cb;
         if( got > n )
@@ -1639,11 +1679,17 @@ static Boolean pmPromptRead_( void )
     {
         gPromptSuspect = True;
         static int sEmptyLogs = 0;
-        if( gLog != 0 && sEmptyLogs < 4 )
+        if( gLog != 0 && sEmptyLogs < 6 )
             {
             ++sEmptyLogs;
-            fprintf( gLog, "prompt empty read at len %ld\n",
-                     (long) gPromptLen ), fflush( gLog );
+            /* The triple as the control answered it: which of the
+               two lies -- the query saying zero, or the export
+               giving nothing against a positive query -- is the
+               next log's first sentence. */
+            fprintf( gLog, "prompt empty read at len %ld q=%lu "
+                     "exp=%ld cb=%lu\n",
+                     (long) gPromptLen, (unsigned long) n,
+                     (long) exp, (unsigned long) cb ), fflush( gLog );
             }
     }
     else if( got > 0 )
@@ -1808,8 +1854,27 @@ static Boolean  gEntrySawChar = False;
 static int      gKeyProbe     = 0;      // the pump's raw-key log, capped
 static int      gCtlNotes     = 0;      // the group's entry-note log, capped
 
+/* Enter's keys never ride the capped probe: the sessions that needed
+   them were exactly the ones where the cap had run out.  Whatever
+   arrives for the Enter scan or the 0x0D character is logged whole,
+   every layer, first. */
+static int gEkProbe = 0;
+
 static Boolean pmPromptKey_( const QMSG &q )
 {
+    if( gEkProbe < 32 && gLog != 0
+        && ( ( q.msg == WM_CHAR && (short) SHORT1FROMMP( q.mp2 ) == 0x0D )
+             || ( ( q.msg == kWmKeyDown || q.msg == kWmKeyUp )
+                  && ( (uchar) CHAR4FROMMP( q.mp1 ) == 0x1C
+                       || (uchar) SHORT1FROMMP( q.mp1 ) == 0x1C ) ) ) )
+        {
+        ++gEkProbe;
+        fprintf( gLog, "ek m=0x%x mp1=%x:%x mp2=%x:%x\n", (unsigned) q.msg,
+                 (unsigned) SHORT2FROMMP( q.mp1 ),
+                 (unsigned) SHORT1FROMMP( q.mp1 ),
+                 (unsigned) SHORT2FROMMP( q.mp2 ),
+                 (unsigned) SHORT1FROMMP( q.mp2 ) ), fflush( gLog );
+        }
     if( q.msg == WM_CHAR )
         {
         const ULONG flags = SHORT1FROMMP( q.mp1 );
@@ -2445,7 +2510,7 @@ static Boolean deliverMessage( QMSG &q )
        the session.  The box decides which of the layers below are
        alive; the log is the evidence, and the cap keeps a held key
        from filling the file. */
-    if( gKeyProbe < 48 && gLog != 0
+    if( gKeyProbe < 256 && gLog != 0
         && ( q.msg == WM_CHAR
              || q.msg == WM_COMMAND
              || q.msg == WM_CONTROL
