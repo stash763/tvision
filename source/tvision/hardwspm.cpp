@@ -2321,13 +2321,7 @@ static MRESULT EXPENTRY pmStatusProc( HWND hwnd, ULONG msg,
     case WM_PAINT:
         {
         RECTL clip;
-        /* The PS carries the system information WinDrawText reads --
-           a WinBeginPaint(0) manufactured PS has none of it, and the
-           text then draws as nothing at all, silently; both 11 and 12
-           show the band filled and letterless.  timeserv's WinDrawText
-           calls run on a WinGetPS PS (udtime.c:155), and that is the
-           pairing. */
-        const HDC hdc = WinBeginPaint( hwnd, WinGetPS( hwnd ), &clip );
+        const HDC hdc = WinBeginPaint( hwnd, 0, &clip );
         if( hdc != 0 )
             {
             RECTL r;
@@ -2345,27 +2339,38 @@ static MRESULT EXPENTRY pmStatusProc( HWND hwnd, ULONG msg,
                 }
             if( cch > 0 )
                 {
+                /* Draw with the PS's own text attributes -- eFTE's
+                   working combination on this platform (g_pm.cpp:798:
+                   DT_TEXTATTRS and 0,0 colors).  Bare color values
+                   are what killed every previous build: WinDrawText
+                   answers them with a system-information query this
+                   PS cannot satisfy and reports 0 drawn, err=81001
+                   (PMERR_INVALID_HWND) -- the 17:59 log.  PS colors
+                   are GPI palette indices, so the theme RGBs cross
+                   over through GpiQueryColorIndex; the font stays
+                   the PS default, the same default that renders
+                   eFTE's prompts. */
+                const LONG fgIdx = GpiQueryColorIndex( hdc, 0UL,
+                                                       (LONG) gChromeFg );
+                const LONG bgIdx = GpiQueryColorIndex( hdc, 0UL,
+                                                       (LONG) gChromeBg );
+                GpiSetColor( hdc, fgIdx );
+                GpiSetBackColor( hdc, bgIdx );
+                GpiSetBackMix( hdc, BM_OVERPAINT );
                 RECTL tr = r;
                 tr.xLeft += 6;   // the margin PM's own controls wear
                 const LONG drawn =
                     WinDrawText( hdc, (LONG) cch, (PCH) gStatusText, &tr,
-                                 (LONG) gChromeFg, (LONG) gChromeBg,
-                                 DT_LEFT | DT_VCENTER );
-                /* EDM: returns 0 with an error, and its colors have
-                   been documented as both "color" and "index" --
-                   which of the failures this silent one was, the
-                   error code answers: PMERR_INVALID_FLAG indicts the
-                   flags, PMERR_INVALID_COLOR indicts the RGB values,
-                   a positive count means the glyphs are on their way
-                   and the mystery is elsewhere. */
+                                 0L, 0L,
+                                 DT_LEFT | DT_VCENTER | DT_TEXTATTRS );
                 static int sDrawLogs = 0;
                 if( gLog != 0 && sDrawLogs < 3 )
                     {
                     ++sDrawLogs;
-                    fprintf( gLog, "status draw n=%ld err=%x fg=%lx bg=%lx\n",
+                    fprintf( gLog,
+                             "status draw n=%ld err=%x fgi=%ld bgi=%ld\n",
                              drawn, (unsigned) WinGetLastError( gHab ),
-                             (unsigned long) gChromeFg,
-                             (unsigned long) gChromeBg ), fflush( gLog );
+                             fgIdx, bgIdx ), fflush( gLog );
                     }
                 }
             WinEndPaint( hdc );
