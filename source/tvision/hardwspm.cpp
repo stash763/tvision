@@ -375,6 +375,17 @@ static LONG   gMleLineH     = 0;
 static LONG   gMleDesc      = 0;
 static const LONG kEntryMaxChars = 4096;
 static char   gMleBuf[ kEntryMaxChars * 2 + 8 ];
+    /* The copy handed to the application.  MLM_DELETE inside a submit
+       sends MLN_CHANGE to the group, the notification's re-entrant
+       poll reads the just-empty field, and that read closes gMleBuf
+       with a '\0' at offset zero before the hand-over completes --
+       the 3:23a log's fingerprint is submit len=4 followed by an
+       empty read at len 4, and the app, offered the empty string,
+       refused it.  What is being submitted lives here across the
+       delete, and the poll stands down while the delete is in
+       flight (gInSubmit). */
+static char     gSubmitBuf[ kEntryMaxChars + 1 ];
+static Boolean  gInSubmit = False;
                                 // export writes every paragraph break
                                 // as a full CR/LF while the query counts
                                 // each as one character, so the byte
@@ -1872,24 +1883,25 @@ static ULONG pmUnCrlf_( char *p, ULONG n )
 }
 
 /* The submit, from either hand that calls it (the pump's Enter
-   intercept, or its Enter fallback): export, and if there is
-   anything in there, clear and shrink and hand the copy over.  The
-   clear is mcispy's MLM_DELETE over the generous range
-   (mcispy.c:227) -- focus and caret stay where they are, unlike with
-   destroy-and-recreate -- and the shrink happens now rather than on
-   the next beat's export: a prompt still full a quarter second after
-   Enter looks like a message that never sent. */
+   intercept, or its Enter fallback): export, copy the answer away
+   from the field, and if there is anything in there, clear and
+   shrink and hand the copy over.  The copy is not ceremony: the
+   clear fires MLN_CHANGE, and that notification's re-entrant read
+   writes its zero-length export straight into gMleBuf while the
+   hand-over is still holding it -- the 3:23a session refused every
+   submit as an empty string this way.  The clear is pmrexx's
+   delete-by-exact-size (pmrexx.c:837); mcispy's generous count is
+   refused outright on this box (the 1:34a log), and the delete's
+   MRESULT is a count, not a status: r=4 alongside 4 deleted
+   characters is success. */
 static void pmPromptSubmitNow_( void )
 {
     pmPromptRead_();
     /* MLM_DELETE counts in the query's currency -- one character per
        paragraph break -- and on this box an over-run count deletes
-       nothing at all rather than everything: the 1:34a log shows the
-       text alive after the delete, the query and export frozen
-       behind it, and the next Enter submitting the same four
-       characters again.  pmrexx clears an MLE with the exact size
-       (pmrexx.c:837); the exact size measured from the raw bytes is
-       the byte count less one for every CR/LF pair. */
+       nothing at all rather than everything.  The exact size measured
+       from the raw bytes is the byte count less one for every
+       CR/LF pair. */
     ULONG chars = 0;
     for( ULONG i = 0; i < gMleCb; ++i )
         if( ! ( gMleBuf[ i ] == '\r' && i + 1 < gMleCb
@@ -1898,33 +1910,40 @@ static void pmPromptSubmitNow_( void )
     ULONG cb = pmUnCrlf_( gMleBuf, gMleCb );
     if( cb == 0 )
         return;                        // silence is not submitted
+    if( cb > (ULONG) kEntryMaxChars )
+        cb = (ULONG) kEntryMaxChars;   // the control holds 4096; the
+                                       // copy only promises that many
+    memcpy( gSubmitBuf, gMleBuf, cb );
+    gSubmitBuf[ cb ] = '\0';
     if( gLog != 0 )
         fprintf( gLog, "entry submit len=%lu\n", (unsigned long) cb ),
             fflush( gLog );
+    gInSubmit = True;
     if( chars > 0 )
         {
         const MRESULT dr = WinSendMsg( gEntry, MLM_DELETE,
                                        MPFROMLONG( 0 ),
                                        MPFROMLONG( chars ) );
-        if( dr != 0 && gLog != 0 )
+        if( gLog != 0 )
             {
             static int sDelLogs = 0;
             if( sDelLogs < 4 )
                 {
                 ++sDelLogs;
-                fprintf( gLog, "clear failed r=%x chars=%lu\n",
+                fprintf( gLog, "clear r=%x chars=%lu\n",
                          (unsigned) (ULONG) dr,
                          (unsigned long) chars ), fflush( gLog );
                 }
             }
         }
+    gInSubmit = False;
     gPromptHash = pmHash_( "", 0 );
     gPromptLen = 0;
     gPromptSaw = 0;
     gPromptLines = 1;
     gPromptSuspect = False;   // this clear was done by our own hand
     pmPromptGrow_( 1 );
-    pmPromptSubmit( gMleBuf );
+    pmPromptSubmit( gSubmitBuf );
 }
 
 /* Growth rides the wait loop's beat next to pmSyncScrollBar's.  One
@@ -1936,6 +1955,13 @@ static void pmPromptSubmitNow_( void )
 static void pmPromptPoll( void )
 {
     if( gEntry == 0 || gMleLineH <= 0 || gGroup == 0 )
+        return;
+    /* Stand down mid-submit: the MLN_CHANGE that MLM_DELETE fires
+       calls in through the group while the submit is between its
+       export and its hand-over, and a re-entrant read of the just-
+       emptied field used to corrupt the text on its way to the
+       application (the 3:23a empty-string refusals). */
+    if( gInSubmit )
         return;
     /* No format/wrap probe lives here any more.  The stamped build
        of 17:02:34 died between wait #1 and wait #2 with this file's
