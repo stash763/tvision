@@ -1461,7 +1461,11 @@ static HWND pmCreateEntry( void )
    not.  Words longer than the line split as the MLE splits them.
    (The control's own line count is a query this box answers with
    zero; that is exactly the thing this function does not have to
-   believe.) */
+   believe.  It answers zero itself when the measurement cannot be
+   taken, and zero moves nothing: after the failed-handle guard the
+   2026-11-03 postmortem caught a third liar -- GPI widths answering
+   zero during the page-rebuild churn, which measures any text as
+   one line.  A dead ruler must not vote. */
 static LONG pmPromptLines_( const char *text, LONG len, LONG width )
 {
     if( len <= 0 )
@@ -1482,6 +1486,17 @@ static LONG pmPromptLines_( const char *text, LONG len, LONG width )
                                // "one line" and folded the strip
     const LONG spw = (LONG) GpiQueryTabbedTextExtent( hps, 1, (PCH) " ",
                                                       0, NULL );
+    if( spw <= 0 )
+        {
+        /* A space that measures zero is a ruler with no marks on
+           it: GPI is failing right now, and every width it hands
+           back would say "the text fits".  Report no answer.  (The
+           2026-11-03 collapse to one line of an eight-line prompt
+           at three witnesses is this GPI lying, read by the raw
+           triple that proved the text itself read back whole.) */
+        WinReleasePS( hps );
+        return 0;
+        }
     LONG total = 0;
     LONG a = 0;
     for( ;; )
@@ -1493,13 +1508,21 @@ static LONG pmPromptLines_( const char *text, LONG len, LONG width )
         LONG j = a;
         while( j < b )
             {
-            if( text[j] == ' ' )
-                { ++pending; ++j; continue; }
+            if( text[j] == ' ' || text[j] == '\t' )
+                { ++pending; ++j; continue; }   // tabs count one space
             LONG k = j;
-            while( k < b && text[k] != ' ' )
+            while( k < b && text[k] != ' ' && text[k] != '\t' )
                 ++k;
             const LONG ww = (LONG) GpiQueryTabbedTextExtent(
                 hps, (LONG) ( k - j ), (PCH) ( text + j ), 0, NULL );
+            if( ww <= 0 )
+                {
+                /* A real word of printables measuring zero: the
+                   ruler broke mid-text.  No answer, and the strip
+                   waits in the shape it already has. */
+                WinReleasePS( hps );
+                return 0;
+                }
             LONG need = ww + pending * spw;
             if( x > 0 && x + need > avail )
                 { ++count; x = 0; need = ww; }   // the break eats its spaces
@@ -1657,6 +1680,41 @@ static Boolean pmPromptRead_( void )
                                   MPVOID, MPVOID );
     if( n > (ULONG) kEntryMaxChars )
         n = (ULONG) kEntryMaxChars;
+    /* Two back-to-back messages on this one thread, and the text
+       cannot change between them: every disagreement any pair of
+       answers gives is a miscount, never news.  A length that
+       dropped since the last good read gets a second opinion at
+       once, and an export that returns other than the queried
+       count -- whole, not truncated -- is the same question asked
+       of the second message.  Each guard keeps the previous good
+       buffer and count untouched when it fires, so a lied-about
+       beat reads as "no news" to the growth engine; and each has a
+       release valve, because text really does shrink (Backspace
+       held is nine lines in a second) and a control whose doubt
+       never lifts must eventually be believed: four consecutive
+       identical suspisions are accepted as fact, four polls of the
+       truth and no more. */
+    static int sWobbleRun = 0;
+    static int sMismatchRun = 0;
+    if( n < (ULONG) gPromptLen && sWobbleRun < 4 )
+        {
+        const ULONG n2 = (ULONG) WinSendMsg( gEntry, MLM_QUERYTEXTLENGTH,
+                                             MPVOID, MPVOID );
+        if( n2 != n )
+            {
+            ++sWobbleRun;
+            gPromptSuspect = True;
+            static int sWobbleLogs = 0;
+            if( gLog != 0 && sWobbleLogs < 6 )
+                {
+                ++sWobbleLogs;
+                fprintf( gLog, "prompt query wobble %lu/%lu run %d\n",
+                         (unsigned long) n, (unsigned long) n2,
+                         sWobbleRun ), fflush( gLog );
+                }
+            return False;       // last good buffer stands
+            }
+        }
     ULONG got = 0;
     ULONG cb = 0;
     LONG exp = 0;
@@ -1667,12 +1725,32 @@ static Boolean pmPromptRead_( void )
         const MRESULT r = WinSendMsg( gEntry, MLM_EXPORT, MPFROMP( &off ),
                                       MPFROMLONG( &cb ) );
         exp = (LONG) r;
+        if( exp > 0 && (ULONG) exp != n && sMismatchRun < 4 )
+            {
+            ++sMismatchRun;
+            gPromptSuspect = True;
+            static int sMismatchLogs = 0;
+            if( gLog != 0 && sMismatchLogs < 6 )
+                {
+                ++sMismatchLogs;
+                fprintf( gLog, "prompt export mismatch q=%lu exp=%ld "
+                         "run %d\n",
+                         (unsigned long) n, (long) exp, sMismatchRun ),
+                        fflush( gLog );
+                }
+            return False;       // last good buffer stands
+            }
         got = (ULONG) exp;
         if( got == 0 )
             got = cb;
         if( got > n )
             got = n;
     }
+    if( n >= (ULONG) gPromptLen )
+        {
+        sWobbleRun = 0;
+        sMismatchRun = 0;
+        }
     gMleBuf[ got ] = '\0';
     gMleCb = got;
     if( got == 0 && gPromptLen > 0 )
@@ -1863,7 +1941,8 @@ static int gEkProbe = 0;
 static Boolean pmPromptKey_( const QMSG &q )
 {
     if( gEkProbe < 32 && gLog != 0
-        && ( ( q.msg == WM_CHAR && (short) SHORT1FROMMP( q.mp2 ) == 0x0D )
+        && ( ( q.msg == WM_CHAR
+               && (uchar) CHAR1FROMMP( q.mp2 ) == 0x0D )
              || ( ( q.msg == kWmKeyDown || q.msg == kWmKeyUp )
                   && ( (uchar) CHAR4FROMMP( q.mp1 ) == 0x1C
                        || (uchar) SHORT1FROMMP( q.mp1 ) == 0x1C ) ) ) )
@@ -1878,8 +1957,39 @@ static Boolean pmPromptKey_( const QMSG &q )
     if( q.msg == WM_CHAR )
         {
         const ULONG flags = SHORT1FROMMP( q.mp1 );
+        /* The character is the low byte, and only the low byte: this
+           machine packs the originating scan code into the high byte
+           of mp2's character word (raw 2026-11-03, mp2=0x1e1c0d for
+           Enter: character 0x0D, scan 0x1C riding above it; ordinary
+           digit keydowns show clean 0x30..0x39 only because their
+           scan byte arrives zero at the packing instant, and Ctrl+T
+           carries 0x1414).  The 16-bit reading silently killed the
+           Enter submit, the Shift+Enter insert, and Ctrl+T alike. */
+        const short ch = (short) (uchar) CHAR1FROMMP( q.mp2 );
+        /* Enter first, before the key-up guard: the box posts one
+           WM_CHAR per Enter press (digits make a down/up pair; the
+           raw log shows Enter making one message), and that lone
+           message carries flags the guard would call key-up.  It is
+           the whole of Enter's speech; it must be heard.  Shift
+           marks itself in the flags (raw 0x14e with the 0x08 bit set
+           under Shift+Enter), and the two halves of the promise
+           split on it. */
+        if( ch == 0x0D )
+            {
+            gEntrySawChar = True;
+            gEnterKd = False;
+            if( ( flags & kKcShift ) != 0 )
+                {
+                pmPromptPreage_( '\n' );
+                WinSendMsg( gEntry, MLM_INSERT, MPFROMP( "\r\n" ),
+                            MPVOID );
+                return False;   // ours: never reach the MLE's table
+                }
+            pmPromptSubmitNow_();
+            return False;
+            }
         if( ( flags & kKcKeyUp ) != 0 )
-            return True;
+            return True;            // the echo of a key: the control's
         gEntrySawChar = True;
         gEnterKd = False;       // the rich path is alive: fallback off
         if( ( flags & kKcAlt ) != 0 )
@@ -1889,7 +1999,6 @@ static Boolean pmPromptKey_( const QMSG &q )
                         (uchar) CHAR4FROMMP( q.mp1 ) );
             return False;
             }
-        const short ch = (short) SHORT1FROMMP( q.mp2 );
         if( ( flags & kKcCtrl ) != 0 && ch == 0x14 )
             {
             pmToggleThinking();
@@ -1899,29 +2008,6 @@ static Boolean pmPromptKey_( const QMSG &q )
         if( scan == 0x49 || scan == 0x51 )
             {
             pmTranscriptPage( scan == 0x49 ? -1 : 1 );
-            return False;
-            }
-        if( ch == 0x0D )
-            {
-            if( ( flags & kKcShift ) != 0 )
-                {
-                /* The newline, inserted by our own hand: this box's
-                   WM_CHAR carried Enter's character with the Shift
-                   flag to the pump, and dispatching it on left the
-                   text unchanged -- the MLE's default command table
-                   answers the shifted Enter with nothing.  MLM_INSERT
-                   is the message this box has answered since the
-                   birth probe, and the CR/LF pair is what the
-                   control itself stores for a hard break (the
-                   pmUnCrlf_ pass knows the shape).  Room first,
-                   character after: the tense the growth engine
-                   learned. */
-                pmPromptPreage_( '\n' );
-                WinSendMsg( gEntry, MLM_INSERT, MPFROMP( "\r\n" ),
-                            MPVOID );
-                return False;       // ours now: never reach the table
-                }
-            pmPromptSubmitNow_();
             return False;
             }
         if( ch >= 0x20 && ( ( flags & kKcCtrl ) == 0 ) )
