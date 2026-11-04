@@ -407,6 +407,7 @@ void pmPromptSubmit( const char *text );
 void pmTranscriptPage( int direction );
 void pmToggleThinking( void );
 int  pmKitPromptLines( void );
+int  pmKitWindowAttr( void );
 }
 static Boolean gAvioOk   = False;
 static Boolean gPmUp    = False; // window + queue exist; drawing is legal
@@ -1327,14 +1328,76 @@ static void pmSetFixedFont_( HWND h )
     WinReleasePS( hps );
 }
 
+/* The theme's two chrome colors.  The app answers one question -- the
+   palette attribute (foreground and background nibbles) that the current
+   theme gives normal window text -- and these tables turn each nibble
+   into the RGB the page engine's palette shows for it: classic reads
+   black on white, dark reads light gray on dark gray.  Index 7 of the
+   background table is white, which is what the classic windows already
+   show on this box's page; the foreground's 7 stays the engine's light
+   gray.  An RGB CLRREF (type zero, the color in the longword) is what
+   MLM_SETTEXTCOLOR, MLM_SETBACKCOLOR and the status paint all eat. */
+static const ULONG kAtuiFgPal[ 16 ] =
+    {
+    0x000000, 0x0000A8, 0x00A800, 0x00A8A8,
+    0xA80000, 0xA800A8, 0xA85400, 0xA8A8A8,
+    0x545454, 0x5454FC, 0x50FC00, 0x54FCFC,
+    0xFC5454, 0xFC54FC, 0xFCFC54, 0xFFFFFF
+    };
+static const ULONG kAtuiBgPal[ 16 ] =
+    {
+    0x000000, 0x0000A8, 0x00A800, 0x00A8A8,
+    0xA80000, 0xA800A8, 0xA85400, 0xFFFFFF,
+    0x545454, 0x5454FC, 0x50FC00, 0x54FCFC,
+    0xFC5454, 0xFC54FC, 0xFCFC54, 0xFFFFFF
+    };
+static ULONG gChromeFg = 0x000000;
+static ULONG gChromeBg = 0xFFFFFF;
+
+static void pmChromeRead_( void )
+{
+    const int a = pmKitWindowAttr();
+    gChromeFg = kAtuiFgPal[ a & 0x0F ];
+    gChromeBg = kAtuiBgPal[ ( a >> 4 ) & 0x0F ];
+    if( gLog != 0 )
+        fprintf( gLog, "chrome theme a=%02x fg=%06lx bg=%06lx\n",
+                 a & 0xFF, (unsigned long) gChromeFg,
+                 (unsigned long) gChromeBg ), fflush( gLog );
+}
+
+/* Repaint the chrome in the theme's colors: called at birth by the
+   entry's own creation and, through pmChromeRefresh, by the theme
+   dialog the moment a new theme is applied.  The MLE takes its colors
+   as messages, proven ones (they are the pair that ended the black-box
+   birth); the strip needs nothing but a repaint -- its paint handler
+   reads the two variables at the top of every visit. */
+static void pmChromeApply_( void )
+{
+    pmChromeRead_();
+    if( gEntry != 0 )
+        {
+        WinSendMsg( gEntry, MLM_SETTEXTCOLOR, MPFROMLONG( gChromeFg ),
+                    MPVOID );
+        WinSendMsg( gEntry, MLM_SETBACKCOLOR, MPFROMLONG( gChromeBg ),
+                    MPVOID );
+        }
+    if( gStatusBar != 0 )
+        WinInvalidateRect( gStatusBar, NULL, False );
+}
+
+extern "C" void pmChromeRefresh( void )
+{
+    pmChromeApply_();
+}
+
 /* Make the prompt: the wrapping variant the toolkit ships
    (MLS_WORDWRAP, sty_dlg.c:1703), the documented creation data
    above giving its format rectangle a real width from the first
-   layout, and the sample's own colors applied after birth
-   (sty_init.c:159: CLR_BLACK on CLR_WHITE -- the MLE's defaults are
-   a black box, which the user has now seen).  Text limit stays a
-   plain LONG message; reading stays the exact-count export pair;
-   clearing stays mcispy's MLM_DELETE range. */
+   layout, and its colors set after birth -- the theme's own, read at
+   the block above; the MLE's defaults are a black box, which the user
+   has now seen (sty_init.c:159 colors by message is the mechanic).
+   Text limit stays a plain LONG message; reading stays the exact-count
+   export pair; clearing stays mcispy's MLM_DELETE range. */
 static HWND pmCreateEntry( void )
 {
     AtuiMleCtlData cd;
@@ -1364,8 +1427,9 @@ static HWND pmCreateEntry( void )
                                     0, &cd, NULL );
     if( h == 0 )
         return 0;
-    WinSendMsg( h, MLM_SETTEXTCOLOR, MPFROMLONG( CLR_BLACK ), MPVOID );
-    WinSendMsg( h, MLM_SETBACKCOLOR, MPFROMLONG( CLR_WHITE ), MPVOID );
+    pmChromeRead_();
+    WinSendMsg( h, MLM_SETTEXTCOLOR, MPFROMLONG( gChromeFg ), MPVOID );
+    WinSendMsg( h, MLM_SETBACKCOLOR, MPFROMLONG( gChromeBg ), MPVOID );
     const LONG fit = (LONG) WinSendMsg( h, MLM_SETTEXTLIMIT,
                                         MPFROMLONG( kEntryMaxChars ),
                                         MPVOID );
@@ -2158,6 +2222,59 @@ static MRESULT EXPENTRY pmGroupProc( HWND hwnd, ULONG msg,
         }
 }
 
+/* The status strip: not a button, not a control -- a band of the
+   theme's two colors along the floor of the window with a sentence of
+   text in it, which is what a status bar has always been.  (It used
+   to be a WC_BUTTON, and every pixel of that said button: a bevelled
+   slab with "atui" on it that the eye read as the biggest button in
+   the application.)  The window's text is the message -- pmStatusKit
+   writes it and invalidates, both proven primitives; no WM_TEXTUPDATE
+   alarm, that message number appears in no header and no sample on
+   the mirrors, and a guessed message is how this file has GPV'd a
+   box before.  WM_PAINT draws the band: background filled, text drawn
+   left with a margin and vertically centered, both colors the chrome's
+   -- the kit's own two variables, read at every visit, so a theme
+   change lands with the next blink.  WinDrawText and WinFillRect take
+   the RGB CLRREFs directly (timeserv's paint loop and pnt.c:81, the
+   proven shapes). */
+static MRESULT EXPENTRY pmStatusProc( HWND hwnd, ULONG msg,
+                                      MPARAM mp1, MPARAM mp2 )
+{
+    switch( msg )
+        {
+    case WM_ERASEBACKGROUND:
+        return (MRESULT) 1;     // the paint below is the whole picture
+
+    case WM_PAINT:
+        {
+        RECTL clip;
+        const HDC hdc = WinBeginPaint( hwnd, 0, &clip );
+        if( hdc != 0 )
+            {
+            RECTL r;
+            WinQueryWindowRect( hwnd, &r );
+            WinFillRect( hdc, &r, (LONG) gChromeBg );
+            char text[ 256 ];
+            const LONG cch =
+                WinQueryWindowText( hwnd, (ULONG) sizeof( text ) - 1,
+                                    (PSZ) text );
+            if( cch > 0 )
+                {
+                text[ cch ] = '\0';
+                RECTL tr = r;
+                tr.xLeft += 6;   // the margin PM's own controls wear
+                WinDrawText( hdc, cch, (PCH) text, &tr,
+                             (LONG) gChromeFg, (LONG) gChromeBg,
+                             DT_LEFT | DT_VCENTER );
+                }
+            WinEndPaint( hdc );
+            }
+        return 0;
+        }
+        }
+    return WinDefWindowProc( hwnd, msg, mp1, mp2 );
+}
+
 static MRESULT EXPENTRY pmWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
 {
     switch( msg )
@@ -2880,6 +2997,17 @@ static void pmOpenWindow()
         gHab = 0;
         return;
         }
+    // The status strip's class: painted, inert, one sentence wide.
+    if( !WinRegisterClass( gHab, "AtuiStatus", (PFNWP) pmStatusProc,
+                           CS_SIZEREDRAW, 0 ) )
+        {
+        pmLogErr( "WinRegisterClass status" );
+        WinDestroyMsgQueue( gHmq );
+        WinTerminate( gHab );
+        gHmq = 0;
+        gHab = 0;
+        return;
+        }
     // The prompt, third of the three: the box's own MLE textbox,
     // created by pmCreateEntry below the moment the group exists to
     // hold it.
@@ -2963,21 +3091,11 @@ static void pmOpenWindow()
         gStatusH = 18;
     gEntryH = gStatusH + 2 * (LONG) WinQuerySysValue( HWND_DESKTOP,
                                                       SV_CYBORDER ) + 4;
-    gStatusBar = WinCreateWindow( gGroup, WC_BUTTON, "atui",
-                                  WS_VISIBLE | BS_TEXT | BS_AUTOSIZE,
+    gStatusBar = WinCreateWindow( gGroup, "AtuiStatus", "atui",
+                                  WS_VISIBLE,
                                   0, 0, 0, 0, gGroup, HWND_TOP,
                                   0, NULL, NULL );
-    if( gStatusBar != 0 )
-        {
-        /* BS_AUTOSIZE sized the button to its text (eFTE reads a created
-           button's size the same way, g_pm.cpp:753); the height it chose
-           is the strip's height, measured by the toolkit itself. */
-        SWP swp;
-        WinQueryWindowPos( gStatusBar, &swp );
-        if( swp.cy >= 8 )
-            gStatusH = swp.cy;
-        }
-    else
+    if( gStatusBar == 0 )
         pmLogErr( "status create" );
     gEntry = pmCreateEntry();
     if( gEntry != 0 )
@@ -3141,7 +3259,10 @@ static void pmCloseWindow()
 extern "C" void pmStatusKit( const char *text )
 {
     if( gStatusBar != 0 && text != 0 )
+        {
         WinSetWindowText( gStatusBar, (PSZ) text );
+        WinInvalidateRect( gStatusBar, NULL, False );
+        }
 }
 
 extern "C" void pmKeysToPageKit( int on )

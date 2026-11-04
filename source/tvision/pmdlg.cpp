@@ -64,6 +64,9 @@ extern HWND pmFrameWindow( void );
 extern void pmNoteDialog( int delta );    // hardwspm.cpp: the driver
                                           // defers resizes while the
                                           // count is up
+extern "C" void pmChromeRefresh( void );  // hardwspm.cpp: repaint the
+                                          // prompt and the status band
+                                          // in the theme's colors
 
 /* LM_QUERYSELECTION's "nothing selected" answer is the -1 MPARAM that later
    SDKs spell MP_DELNEG; neither header set this build reads carries the
@@ -168,6 +171,10 @@ MRESULT EXPENTRY pmThemeDlgProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
             pmThemeApply( WinSendDlgItemMsg( hwnd, kCtlThemeClassic,
                                              BM_QUERYCHECK,
                                              MPVOID, MPVOID ) ? 0 : 1 );
+            // The tvision screen follows the palette on its own; the
+            // native chrome -- prompt colors, status band -- follows only
+            // when the driver is told to re-read them (hardwspm.cpp).
+            pmChromeRefresh();
             WinDismissDlg( hwnd, TRUE );
             return 0;
         case DID_CANCEL:
