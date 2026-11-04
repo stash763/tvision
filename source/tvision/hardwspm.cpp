@@ -2321,13 +2321,28 @@ static MRESULT EXPENTRY pmStatusProc( HWND hwnd, ULONG msg,
     case WM_PAINT:
         {
         RECTL clip;
-        const HDC hdc = WinBeginPaint( hwnd, 0, &clip );
+        /* The PS carries the system information WinDrawText reads --
+           a WinBeginPaint(0) manufactured PS has none of it, and the
+           text then draws as nothing at all, silently; both 11 and 12
+           show the band filled and letterless.  timeserv's WinDrawText
+           calls run on a WinGetPS PS (udtime.c:155), and that is the
+           pairing. */
+        const HDC hdc = WinBeginPaint( hwnd, WinGetPS( hwnd ), &clip );
         if( hdc != 0 )
             {
             RECTL r;
             WinQueryWindowRect( hwnd, &r );
             WinFillRect( hdc, &r, (LONG) gChromeBg );
             const size_t cch = strlen( gStatusText );
+            static int sPaintLogs = 0;
+            if( gLog != 0 && sPaintLogs < 3 )
+                {
+                ++sPaintLogs;
+                fprintf( gLog, "status paint %ldx%ld cch=%u\n",
+                         (long) ( r.xRight - r.xLeft ),
+                         (long) ( r.yTop - r.yBottom ),
+                         (unsigned) cch ), fflush( gLog );
+                }
             if( cch > 0 )
                 {
                 RECTL tr = r;
