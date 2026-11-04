@@ -374,7 +374,14 @@ static LONG   gEntryH1      = 0;
 static LONG   gMleLineH     = 0;
 static LONG   gMleDesc      = 0;
 static const LONG kEntryMaxChars = 4096;
-static char   gMleBuf[ kEntryMaxChars + 2 ];
+static char   gMleBuf[ kEntryMaxChars * 2 + 8 ];
+                                // export writes every paragraph break
+                                // as a full CR/LF while the query counts
+                                // each as one character, so the byte
+                                // count runs past the queried length by
+                                // the number of breaks (proven: q=12
+                                // exp=14 with two lines); worst case is
+                                // a break between every character
 static ULONG  gMleCb        = 0;
 static ULONG  gPromptHash   = 0;
 static int    gPollBeat     = 0;
@@ -1680,22 +1687,29 @@ static Boolean pmPromptRead_( void )
                                   MPVOID, MPVOID );
     if( n > (ULONG) kEntryMaxChars )
         n = (ULONG) kEntryMaxChars;
-    /* Two back-to-back messages on this one thread, and the text
-       cannot change between them: every disagreement any pair of
-       answers gives is a miscount, never news.  A length that
-       dropped since the last good read gets a second opinion at
-       once, and an export that returns other than the queried
-       count -- whole, not truncated -- is the same question asked
-       of the second message.  Each guard keeps the previous good
-       buffer and count untouched when it fires, so a lied-about
-       beat reads as "no news" to the growth engine; and each has a
-       release valve, because text really does shrink (Backspace
-       held is nine lines in a second) and a control whose doubt
-       never lifts must eventually be believed: four consecutive
-       identical suspisions are accepted as fact, four polls of the
-       truth and no more. */
+    /* Two back-to-back messages of the same kind on this one thread,
+       and the text cannot change between them: a disagreement is a
+       miscount, never news.  A length that dropped since the last
+       good read gets a second opinion at once, and the guard keeps
+       the previous good buffer and count when it fires, so a
+       lied-about beat reads as "no news" to the growth engine.  The
+       guard has a release valve, because text really does shrink
+       (Backspace held is nine lines in a second): four consecutive
+       identical suspisions are accepted as fact.
+       (There used to be a second guard here, cross-examining the
+       export's byte count against the query's -- and it was deleted
+       the same night, having produced two rounds of "inconsistent
+       growth".  The two messages do not speak the same units: the
+       query counts each paragraph break as ONE character and the
+       export materializes each as a full CR/LF pair, so exp exceeds
+       n by the number of breaks -- q=5 exp=6 with one line, q=12
+       exp=14 with two.  No fixed tolerance is right.  And the arm
+       must stay at exactly n: asking more than the export's own
+       count is the one thing this control answers with zero (birth
+       probe), while answering below its armed cb it simply ignores
+       -- it writes its full truth past it, which is why gMleBuf is
+       sized for every character to be a break.) */
     static int sWobbleRun = 0;
-    static int sMismatchRun = 0;
     if( n < (ULONG) gPromptLen && sWobbleRun < 4 )
         {
         const ULONG n2 = (ULONG) WinSendMsg( gEntry, MLM_QUERYTEXTLENGTH,
@@ -1719,49 +1733,21 @@ static Boolean pmPromptRead_( void )
     ULONG cb = 0;
     LONG exp = 0;
     if( n > 0 )
-    {
+        {
         ULONG off = 0;
         cb = n;
         const MRESULT r = WinSendMsg( gEntry, MLM_EXPORT, MPFROMP( &off ),
                                       MPFROMLONG( &cb ) );
         exp = (LONG) r;
-        /* exp == n + 1 is this box being honest, not lying: when the
-           text ends in a hard break, QUERYTEXTLENGTH counts the
-           trailing paragraph break as one character and EXPORT
-           materializes it as the full CR/LF pair (proven 2026-11-03
-           the same evening: "1234" + Shift+Enter answered q=5
-           exp=6, every read, no exception).  The extra byte is the
-           shape of the truth; commit it.  (The first cut of this
-           guard refused it, and the freeze-and-release-valve dance
-           that followed is the "inconsistent growth" report.) */
-        if( exp > 0 && (ULONG) exp != n && (ULONG) exp != n + 1
-            && sMismatchRun < 4 )
-            {
-            ++sMismatchRun;
-            gPromptSuspect = True;
-            static int sMismatchLogs = 0;
-            if( gLog != 0 && sMismatchLogs < 6 )
-                {
-                ++sMismatchLogs;
-                fprintf( gLog, "prompt export mismatch q=%lu exp=%ld "
-                         "run %d\n",
-                         (unsigned long) n, (long) exp, sMismatchRun ),
-                        fflush( gLog );
-                }
-            return False;       // last good buffer stands
-            }
         got = (ULONG) exp;
         if( got == 0 )
-            got = cb;
-        if( got > n + 1 )
-            got = n + 1;        // the trailing break's second byte,
-                                // never more (buffer headroom: two)
-    }
-    if( n >= (ULONG) gPromptLen )
-        {
-        sWobbleRun = 0;
-        sMismatchRun = 0;
+            got = cb;           // the other convention, if it ever
+                                // answers by the pointer
+        if( got > (ULONG) kEntryMaxChars * 2 + 6 )
+            got = (ULONG) kEntryMaxChars * 2 + 6;
         }
+    if( n >= (ULONG) gPromptLen )
+        sWobbleRun = 0;
     gMleBuf[ got ] = '\0';
     gMleCb = got;
     if( got == 0 && gPromptLen > 0 )
