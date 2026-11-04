@@ -1725,7 +1725,17 @@ static Boolean pmPromptRead_( void )
         const MRESULT r = WinSendMsg( gEntry, MLM_EXPORT, MPFROMP( &off ),
                                       MPFROMLONG( &cb ) );
         exp = (LONG) r;
-        if( exp > 0 && (ULONG) exp != n && sMismatchRun < 4 )
+        /* exp == n + 1 is this box being honest, not lying: when the
+           text ends in a hard break, QUERYTEXTLENGTH counts the
+           trailing paragraph break as one character and EXPORT
+           materializes it as the full CR/LF pair (proven 2026-11-03
+           the same evening: "1234" + Shift+Enter answered q=5
+           exp=6, every read, no exception).  The extra byte is the
+           shape of the truth; commit it.  (The first cut of this
+           guard refused it, and the freeze-and-release-valve dance
+           that followed is the "inconsistent growth" report.) */
+        if( exp > 0 && (ULONG) exp != n && (ULONG) exp != n + 1
+            && sMismatchRun < 4 )
             {
             ++sMismatchRun;
             gPromptSuspect = True;
@@ -1743,8 +1753,9 @@ static Boolean pmPromptRead_( void )
         got = (ULONG) exp;
         if( got == 0 )
             got = cb;
-        if( got > n )
-            got = n;
+        if( got > n + 1 )
+            got = n + 1;        // the trailing break's second byte,
+                                // never more (buffer headroom: two)
     }
     if( n >= (ULONG) gPromptLen )
         {
