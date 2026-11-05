@@ -2131,10 +2131,23 @@ static Boolean pmPromptKey_( const QMSG &q )
             pmToggleThinking();
             return False;
             }
+        /* Page keys: match on the virtual key (mp2's high short), the
+           one field whose shape this box has proven for WM_CHAR -- the
+           page-window path decodes the same field, measured carrying
+           0x11 for PageUp.  mp1's scan byte never has been: the scan
+           this machine proved rides mp2's high *byte* instead, so keep
+           it only as a fallback.  Taking the key here also keeps the
+           0x11 byte PgUp carries from landing in the prompt as text. */
+        const uchar virt = (uchar) SHORT2FROMMP( q.mp2 );
         const uchar scan = (uchar) CHAR4FROMMP( q.mp1 );
-        if( scan == 0x49 || scan == 0x51 )
+        if( virt == kVirtPageup || scan == 0x49 )
             {
-            pmTranscriptPage( scan == 0x49 ? -1 : 1 );
+            pmTranscriptPage( -1 );
+            return False;
+            }
+        if( virt == kVirtPagedown || scan == 0x51 )
+            {
+            pmTranscriptPage( 1 );
             return False;
             }
         if( ch >= 0x20 && ( ( flags & kKcCtrl ) == 0 ) )
