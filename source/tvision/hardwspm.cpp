@@ -2195,7 +2195,7 @@ static MRESULT EXPENTRY pmGroupProc( HWND hwnd, ULONG msg,
             {
             RECTL r;
             WinQueryWindowRect( hwnd, &r );
-            WinFillRect( hdc, &r, (LONG) SYSCLR_WINDOW );
+            WinFillRect( hdc, &r, (LONG) SYSCLR_MENU );
             WinEndPaint( hdc );
             }
         static int sGroupPaints = 0;
@@ -2399,18 +2399,20 @@ static MRESULT EXPENTRY pmStatusProc( HWND hwnd, ULONG msg,
         if( hdc != 0 )
             {
             /* The band belongs to the system, not to the theme: an
-               OS/2 status area wears the system window color with
-               black text.  The raw RGB this fill used was another
-               silent no-op of this box -- the dark band of
-               screenshots 13/14 was never painted: it was the
-               text's own background rectangle, which is why it
-               "stopped at thinking".  SYSCLR_* is the color spec
-               WinFillRect understands (timeserv's pair); the GPI
-               colors cross at the nearest palette index, computed
-               from the system's actual window color. */
+               OS/2 status area wears the frame's color with black
+               text.  Measured (screenshot14): the frame and menu
+               strip are #cccccc neutral, SYSCLR_WINDOW resolves to
+               a bluish #cbd1d1 that visibly fails to match --
+               SYSCLR_MENU is the #cccccc.  The raw RGB this fill
+               used before was another silent no-op of this box:
+               the dark band of screenshots 13/14 was never painted
+               -- it was the text's own background rectangle, which
+               is why it "stopped at thinking".  GPI colors cross at
+               the nearest palette index, the background computed
+               from the same system color. */
             RECTL r;
             WinQueryWindowRect( hwnd, &r );
-            WinFillRect( hdc, &r, (LONG) SYSCLR_WINDOW );
+            WinFillRect( hdc, &r, (LONG) SYSCLR_MENU );
             const size_t cch = strlen( gStatusText );
             static int sPaintLogs = 0;
             if( gLog != 0 && sPaintLogs < 8 )
@@ -2444,7 +2446,7 @@ static MRESULT EXPENTRY pmStatusProc( HWND hwnd, ULONG msg,
                    eFTE's prompts. */
                 const LONG fgIdx = GpiQueryColorIndex( hdc, 0UL, 0L );
                 const LONG bgIdx = GpiQueryColorIndex( hdc, 0UL,
-                    WinQuerySysColor( HWND_DESKTOP, SYSCLR_WINDOW, 0L ) );
+                    WinQuerySysColor( HWND_DESKTOP, SYSCLR_MENU, 0L ) );
                 GpiSetColor( hdc, fgIdx );
                 GpiSetBackColor( hdc, bgIdx );
                 GpiSetBackMix( hdc, BM_OVERPAINT );
