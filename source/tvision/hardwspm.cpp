@@ -2177,6 +2177,36 @@ static MRESULT EXPENTRY pmGroupProc( HWND hwnd, ULONG msg,
 {
     switch( msg )
         {
+    /* A group window gets no default background from PM -- the
+       application owns its paint.  Nothing of this shows when the
+       tile is exact, which it is; it shows when a drag runs the
+       frame faster than the children: every region a child vacates
+       is group territory, never painted, and whatever was on the
+       screen before stays there -- the fossils of screenshots 13
+       and 14 (a line of status text riding the entry strip, a
+       scrollbar arrow stranded in the band).  CS_SIZEREDRAW
+       invalidates this window through a resize; WM_PAINT is where
+       the answer was missing. */
+    case WM_PAINT:
+        {
+        RECTL clip;
+        const HDC hdc = WinBeginPaint( hwnd, 0, &clip );
+        if( hdc != 0 )
+            {
+            RECTL r;
+            WinQueryWindowRect( hwnd, &r );
+            WinFillRect( hdc, &r, (LONG) gChromeBg );
+            WinEndPaint( hdc );
+            }
+        static int sGroupPaints = 0;
+        if( gLog != 0 && sGroupPaints < 6 )
+            {
+            ++sGroupPaints;
+            fprintf( gLog, "group paint\n" ), fflush( gLog );
+            }
+        return 0;
+        }
+
     case WM_SIZE:
         {
         RECTL r;
@@ -2249,6 +2279,10 @@ static MRESULT EXPENTRY pmGroupProc( HWND hwnd, ULONG msg,
                      spg.x, spg.y, spg.cx, spg.cy ),
                      fflush( gLog );
             }
+        /* Whatever the children vacated this step is group
+           territory; invalidate so the paint above fills it.
+           (FALSE: no erase — WM_PAINT is the picture.) */
+        WinInvalidateRect( hwnd, NULL, FALSE );
         return 0;
         }
 
@@ -2317,9 +2351,11 @@ static MRESULT EXPENTRY pmGroupProc( HWND hwnd, ULONG msg,
         return 0;
 
     case WM_ERASEBACKGROUND:
-        // The three children cover the group with their own painting; the
-        // default erase would only flash gray behind a resize.
-        return (MRESULT) FALSE;
+        // Claimed: the WM_PAINT above is the picture.  (The FALSE
+        // this used to return asked PM for an erase PM does not
+        // perform for group windows -- which is how vacated regions
+        // kept their fossils.)
+        return (MRESULT) TRUE;
 
     default:
         return WinDefWindowProc( hwnd, msg, mp1, mp2 );
