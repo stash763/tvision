@@ -2216,22 +2216,37 @@ static MRESULT EXPENTRY pmGroupProc( HWND hwnd, ULONG msg,
            lives somewhere in this tiling; ask where the three
            children ended up for the first tilings of a session. */
         static int sTileLogs = 0;
-        if( gLog != 0 && sTileLogs < 6 )
+        if( gLog != 0 && sTileLogs < 40 )
             {
             ++sTileLogs;
+            SWP sp, se, spg;
             RECTL sr, er2, pr;
+            WinQueryWindowPos( gStatusBar != 0 ? gStatusBar : gFrame, &sp );
+            WinQueryWindowPos( gEntry != 0 ? gEntry : gFrame, &se );
+            WinQueryWindowPos( gClient != 0 ? gClient : gFrame, &spg );
             if( gStatusBar != 0 ) WinQueryWindowRect( gStatusBar, &sr );
             else sr.xLeft = sr.yBottom = sr.xRight = sr.yTop = -1;
             if( gEntry != 0 ) WinQueryWindowRect( gEntry, &er2 );
             else er2.xLeft = er2.yBottom = er2.xRight = er2.yTop = -1;
             if( gClient != 0 ) WinQueryWindowRect( gClient, &pr );
             else pr.xLeft = pr.yBottom = pr.xRight = pr.yTop = -1;
+            /* Two queries of the same rectangles: WinQueryWindowPos
+               is the position authority, WinQueryWindowRect the one
+               the paints use -- if they disagree about y, the ghost's
+               origin is the query, not the tiling. */
             fprintf( gLog,
                      "tile st(%ld,%ld-%ld,%ld) en(%ld,%ld-%ld,%ld) "
                      "pg(%ld,%ld-%ld,%ld)\n",
                      sr.xLeft, sr.yBottom, sr.xRight, sr.yTop,
                      er2.xLeft, er2.yBottom, er2.xRight, er2.yTop,
                      pr.xLeft, pr.yBottom, pr.xRight, pr.yTop ),
+                     fflush( gLog );
+            fprintf( gLog,
+                     "pos  st(%ld,%ld,%ld,%ld) en(%ld,%ld,%ld,%ld) "
+                     "pg(%ld,%ld,%ld,%ld)\n",
+                     sp.x, sp.y, sp.cx, sp.cy,
+                     se.x, se.y, se.cx, se.cy,
+                     spg.x, spg.y, spg.cx, spg.cy ),
                      fflush( gLog );
             }
         return 0;
@@ -2355,10 +2370,18 @@ static MRESULT EXPENTRY pmStatusProc( HWND hwnd, ULONG msg,
             if( gLog != 0 && sPaintLogs < 8 )
                 {
                 ++sPaintLogs;
-                fprintf( gLog, "status paint %ldx%ld cch=%u\n",
+                /* The page's y at every band repaint: the artifact
+                   lives where the page and the strips meet, and the
+                   band repaints are timed witnesses of every resize
+                   step. */
+                SWP ppg;
+                if( gClient != 0 ) WinQueryWindowPos( gClient, &ppg );
+                else ppg.x = ppg.y = ppg.cx = ppg.cy = -1;
+                fprintf( gLog, "status paint %ldx%ld cch=%u pg(%ld,%ld,%ld,%ld)\n",
                          (long) ( r.xRight - r.xLeft ),
                          (long) ( r.yTop - r.yBottom ),
-                         (unsigned) cch ), fflush( gLog );
+                         (unsigned) cch,
+                         ppg.x, ppg.y, ppg.cx, ppg.cy ), fflush( gLog );
                 }
             if( cch > 0 )
                 {
