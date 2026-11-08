@@ -82,6 +82,7 @@ enum
     kDlgSettings    = 903,
     kDlgProviders   = 904,
     kDlgUndo        = 905,
+    kDlgPrompts     = 906,
 
     kCtlThemeClassic = 401,
     kCtlThemeDark    = 402,
@@ -103,6 +104,15 @@ enum
     kCtlSetNoteJudge  = 446,
     kCtlSetNoteCmd    = 448,
     kCtlSetNotePrompt = 449,
+
+    /* prompts (906): the brief checkbox and the six instruction
+       lines; the two labels share the numbering habit -- ids are
+       the contract with the rc, one entry per row. */
+    kCtlPromptBrief   = 500,
+    kCtlPromptLine1   = 501,
+    kCtlPromptLines   = 6,
+    kCtlPromptLimit   = 158,    /* EM_SETTEXTLIMIT leaves room in the
+                                   160-byte fields of PmPrompts */
     kCtlSetLabelPrompt = 450,
 
     /* providers (904) */
@@ -950,6 +960,83 @@ static int pmProvidersDialog( void )
     return shown;
 }
 
+/* ---------------------------------------------------------------- prompts -- */
+
+/* The system message's user-facing parts: the brief's veto and the
+   instruction lines. All six fields are collected on OK -- empties
+   included, which is the point: apply drops them, so clearing a row
+   here deletes a line rather than leaving it numbered behind. */
+static PmPrompts gPrompts;
+
+MRESULT EXPENTRY pmPromptsDlgProc( HWND hwnd, ULONG msg,
+                                   MPARAM mp1, MPARAM mp2 )
+{
+    switch( msg )
+    {
+    case WM_INITDLG:
+        {
+        pmPromptsSnapshot( &gPrompts );
+        if( gPrompts.hostBrief )
+            WinSendDlgItemMsg( hwnd, kCtlPromptBrief, BM_SETCHECK,
+                               MPVOID, MPVOID );
+        for( int i = 0; i < kCtlPromptLines; ++i )
+            {
+            const USHORT id = (USHORT) ( kCtlPromptLine1 + i );
+            if( i < gPrompts.extraCount )
+                WinSetDlgItemText( hwnd, id, (PSZ) gPrompts.extra[ i ] );
+            WinSendDlgItemMsg( hwnd, id, EM_SETTEXTLIMIT,
+                               MPFROM2SHORT( kCtlPromptLimit, 0 ),
+                               MPVOID );
+            }
+        gDlgShown = 1;          // on screen: the wrapper's proof
+        return 0;
+        }
+
+    case WM_COMMAND:
+        switch( SHORT1FROMMP( mp1 ) )
+        {
+        case DID_OK:
+            {
+            PmPrompts p;
+            p.hostBrief = WinSendDlgItemMsg( hwnd, kCtlPromptBrief,
+                                             BM_QUERYCHECK,
+                                             MPVOID, MPVOID ) ? 1 : 0;
+            p.extraCount = kCtlPromptLines;
+            for( int i = 0; i < kCtlPromptLines; ++i )
+                {
+                p.extra[ i ][ 0 ] = '\0';
+                WinQueryDlgItemText( hwnd, (USHORT) ( kCtlPromptLine1 + i ),
+                                     (LONG) sizeof( p.extra[ i ] ),
+                                     (PSZ) p.extra[ i ] );
+                }
+            pmPromptsApply( &p );   // trim, drop empties, save -- all
+            WinDismissDlg( hwnd, TRUE );
+            return 0;
+            }
+        case DID_CANCEL:
+            WinDismissDlg( hwnd, FALSE );
+            return 0;
+        }
+        break;
+
+    case WM_CLOSE:
+        WinDismissDlg( hwnd, FALSE );
+        return 0;
+    }
+    return WinDefDlgProc( hwnd, msg, mp1, mp2 );
+}
+
+static int pmPromptsDialog( void )
+{
+    pmNoteDialog( +1 );
+    gDlgShown = 0;
+    WinDlgBox( HWND_DESKTOP, pmFrameWindow(), pmPromptsDlgProc,
+               0, kDlgPrompts, NULL );
+    const int shown = gDlgShown;
+    pmNoteDialog( -1 );
+    return shown;
+}
+
 /* Every dialog the front has a native twin for is in the table now; a
    console build never installs the kit at all and draws its tvision
    dialogs, which stay the reference implementations.
@@ -966,6 +1053,7 @@ static const PmDialogs kPmDialogs =
     pmThemeDialog,
     pmSwitchModelDialog,
     pmSettingsDialog,
+    pmPromptsDialog,
     pmProvidersDialog,
     pmUndoDialog,
     pmStatusKit,

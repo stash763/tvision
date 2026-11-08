@@ -1029,6 +1029,7 @@ static void pmTakeCommand( int id )
         { 1102, 0x16, "Alt-U undo"      },
         { 1103, 0x19, "Alt-P providers" },
         { 1104, 0x17, "Alt-I settings"  },
+        { 1107, 0x13, "Alt-R prompts"   },
         { 1105, 0x14, "Alt-T theme"     },
         { 1106, 0x1F, "Alt-S switch model" },
         { 1110, 0x2D, "Alt-X quit"      },
