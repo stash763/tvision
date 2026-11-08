@@ -2943,7 +2943,17 @@ static Boolean deliverMessage( QMSG &q )
     if( gEntry != 0 && q.hwnd == gEntry
         && !pmPromptKey_( q ) )
         return True;
+    /* The corridor is now bracketed: an injected WM_CHAR has been
+       killing this pump mid-delivery in three consecutive sessions
+       -- including a verbatim replay of the physical key's own
+       parameter words -- while the user's console typing sails
+       through.  kmsg proves entry; this proves exit (or not),
+       pinning the trap to the dispatch corridor itself. */
+    if( q.msg == WM_CHAR && gLog != 0 )
+        fprintf( gLog, "pre-dsp\n" ), fflush( gLog );
     WinDispatchMsg( gHab, &q );
+    if( q.msg == WM_CHAR && gLog != 0 )
+        fprintf( gLog, "post-dsp\n" ), fflush( gLog );
     return True;
 }
 
