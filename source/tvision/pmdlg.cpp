@@ -105,14 +105,17 @@ enum
     kCtlSetNoteCmd    = 448,
     kCtlSetNotePrompt = 449,
 
-    /* prompts (906): the brief checkbox and the six instruction
-       lines; the two labels share the numbering habit -- ids are
-       the contract with the rc, one entry per row. */
+    /* prompts (906): the brief checkbox, the file's line and count,
+       a three-row preview, and the two verbs that talk to the editor
+       and the file. */
     kCtlPromptBrief   = 500,
-    kCtlPromptLine1   = 501,
-    kCtlPromptLines   = 6,
-    kCtlPromptLimit   = 158,    /* EM_SETTEXTLIMIT leaves room in the
-                                   160-byte fields of PmPrompts */
+    kCtlPromptPath    = 507,
+    kCtlPromptCount   = 508,
+    kCtlPromptPrev1   = 512,
+    kCtlPromptPrev2   = 513,
+    kCtlPromptPrev3   = 514,
+    kCtlPromptEdit    = 510,
+    kCtlPromptReload  = 511,
     kCtlSetLabelPrompt = 450,
 
     /* providers (904) */
@@ -962,11 +965,51 @@ static int pmProvidersDialog( void )
 
 /* ---------------------------------------------------------------- prompts -- */
 
-/* The system message's user-facing parts: the brief's veto and the
-   instruction lines. All six fields are collected on OK -- empties
-   included, which is the point: apply drops them, so clearing a row
-   here deletes a line rather than leaving it numbered behind. */
-static PmPrompts gPrompts;
+/* The system message's user parts: the brief's veto, a read of the
+   instruction file, and the two verbs. Edit starts the machine's
+   editor on the file and returns -- e.exe holds the window, and the
+   user says when its work is worth looking at by pressing Reload;
+   OK carries the checkbox and nothing else, because the file is the
+   store and a save must never race an editor. */
+static PmPromptsView gPrompts;
+
+static void pmFillPrompts( HWND hwnd )
+{
+    pmPromptsView( &gPrompts );
+    WinSetDlgItemText( hwnd, kCtlPromptPath, (PSZ) gPrompts.filePath );
+    char t[ 96 ];
+    std::snprintf( t, sizeof( t ), "%d lines. Editor: %s",
+                   gPrompts.lineCount, gPrompts.editorName );
+    WinSetDlgItemText( hwnd, kCtlPromptCount, (PSZ) t );
+
+    const USHORT kPrev[ 3 ] = { kCtlPromptPrev1, kCtlPromptPrev2,
+                                kCtlPromptPrev3 };
+    for( int i = 0; i < 3; ++i )
+    {
+        char line[ 130 ];
+        std::snprintf( line, sizeof( line ), "| %s",
+                       gPrompts.preview[ i ][ 0 ] != '\0'
+                           ? gPrompts.preview[ i ]
+                           : ( gPrompts.lineCount > i
+                                 ? "" : "(empty -- nothing extra rides)" ) );
+        WinSetDlgItemText( hwnd, kPrev[ i ], (PSZ) line );
+    }
+    // Set from the view every time. PM has BM_SETCHECK but no
+    // BM_CLEARCHECK, so a mismatch is corrected the way a user
+    // would: one click. A fresh dialog's checkbox starts unchecked,
+    // which makes the common path (view says checked) a set and the
+    // rest a toggle.
+    const BOOL shown = WinSendDlgItemMsg( hwnd, kCtlPromptBrief,
+                                          BM_QUERYCHECK,
+                                          MPVOID, MPVOID )
+                           ? TRUE : FALSE;
+    const BOOL want = gPrompts.hostBrief ? TRUE : FALSE;
+    if( shown && !want )
+        WinSendDlgItemMsg( hwnd, kCtlPromptBrief, BM_CLICK, MPVOID, MPVOID );
+    else if( !shown && want )
+        WinSendDlgItemMsg( hwnd, kCtlPromptBrief, BM_SETCHECK,
+                           MPVOID, MPVOID );
+}
 
 MRESULT EXPENTRY pmPromptsDlgProc( HWND hwnd, ULONG msg,
                                    MPARAM mp1, MPARAM mp2 )
@@ -974,45 +1017,28 @@ MRESULT EXPENTRY pmPromptsDlgProc( HWND hwnd, ULONG msg,
     switch( msg )
     {
     case WM_INITDLG:
-        {
-        pmPromptsSnapshot( &gPrompts );
-        if( gPrompts.hostBrief )
-            WinSendDlgItemMsg( hwnd, kCtlPromptBrief, BM_SETCHECK,
-                               MPVOID, MPVOID );
-        for( int i = 0; i < kCtlPromptLines; ++i )
-            {
-            const USHORT id = (USHORT) ( kCtlPromptLine1 + i );
-            if( i < gPrompts.extraCount )
-                WinSetDlgItemText( hwnd, id, (PSZ) gPrompts.extra[ i ] );
-            WinSendDlgItemMsg( hwnd, id, EM_SETTEXTLIMIT,
-                               MPFROM2SHORT( kCtlPromptLimit, 0 ),
-                               MPVOID );
-            }
+        pmFillPrompts( hwnd );
         gDlgShown = 1;          // on screen: the wrapper's proof
         return 0;
-        }
 
     case WM_COMMAND:
         switch( SHORT1FROMMP( mp1 ) )
         {
+        case kCtlPromptEdit:
+            pmPromptsEdit();    // creates the file, starts the editor
+            return 0;           // the dialog stays: Reload follows
+
+        case kCtlPromptReload:
+            pmFillPrompts( hwnd );
+            return 0;
+
         case DID_OK:
-            {
-            PmPrompts p;
-            p.hostBrief = WinSendDlgItemMsg( hwnd, kCtlPromptBrief,
-                                             BM_QUERYCHECK,
-                                             MPVOID, MPVOID ) ? 1 : 0;
-            p.extraCount = kCtlPromptLines;
-            for( int i = 0; i < kCtlPromptLines; ++i )
-                {
-                p.extra[ i ][ 0 ] = '\0';
-                WinQueryDlgItemText( hwnd, (USHORT) ( kCtlPromptLine1 + i ),
-                                     (LONG) sizeof( p.extra[ i ] ),
-                                     (PSZ) p.extra[ i ] );
-                }
-            pmPromptsApply( &p );   // trim, drop empties, save -- all
+            pmPromptsOk( WinSendDlgItemMsg( hwnd, kCtlPromptBrief,
+                                            BM_QUERYCHECK,
+                                            MPVOID, MPVOID ) ? 1 : 0 );
             WinDismissDlg( hwnd, TRUE );
             return 0;
-            }
+
         case DID_CANCEL:
             WinDismissDlg( hwnd, FALSE );
             return 0;
