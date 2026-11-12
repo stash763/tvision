@@ -83,6 +83,7 @@ enum
     kDlgProviders   = 904,
     kDlgUndo        = 905,
     kDlgPrompts     = 906,
+    kDlgSessions    = 907,
 
     kCtlThemeClassic = 401,
     kCtlThemeDark    = 402,
@@ -138,7 +139,16 @@ enum
     kCtlUndoList      = 481,
     kCtlUndoRestore   = 482,
     kCtlUndoDiscard   = 483,
-    kCtlUndoStatus    = 484
+    kCtlUndoStatus    = 484,
+
+    /* sessions (907) */
+    kCtlSessHeader    = 540,
+    kCtlSessList      = 541,
+    kCtlSessTitle     = 542,
+    kCtlSessNew       = 543,
+    kCtlSessRename    = 544,
+    kCtlSessDelete    = 545,
+    kCtlSessStatus    = 546
 };
 
 /* LM_QUERYITEMTEXT answers through the toolkit's STRREC (os2wrh.h: a
@@ -1063,6 +1073,171 @@ static int pmPromptsDialog( void )
     return shown;
 }
 
+/* ---------------------------------------------------------------- sessions -- */
+
+/* The conversations the app holds.  The list says which one is being
+   looked at ("<- here", carried in the label), the entry field is the
+   title New and Rename take, and Switch -- OK -- visits the chosen
+   row.  Refusals are the app's call (a reply in flight owns the
+   transcript until it lands) and arrive as pmSess* codes, which this
+   box turns into the words the tvision dialog says. */
+
+static void sessFill_( HWND hwndDlg )
+{
+    listClear_( hwndDlg, kCtlSessList );
+    const int n = pmSessionsCount();
+    for( int i = 0; i < n; ++i )
+        WinSendDlgItemMsg( hwndDlg, kCtlSessList, LM_INSERTITEM,
+                           MPFROMSHORT( LIT_END ),
+                           MPFROMP( (PVOID) pmSessionsLabel( i ) ) );
+
+    char t[ 160 ];
+    std::snprintf( t, sizeof( t ),
+                   "Each session is its own conversation. Current: %d",
+                   pmSessionsActive() + 1 );
+    WinSetDlgItemText( hwndDlg, kCtlSessHeader, (PSZ) t );
+}
+
+/* The chosen row's session: the rows sort, so the ordinal the label
+   opens with is the identity -- undoWhich_'s trick, same listbox. */
+static int sessWhich_( HWND hwndDlg )
+{
+    const SHORT sel = SHORT1FROMMR( WinSendDlgItemMsg( hwndDlg,
+        kCtlSessList, LM_QUERYSELECTION, MPFROMSHORT( LIT_FIRST ),
+        MPVOID ) );
+    if( (unsigned short) sel == kNoListSelection )
+        return -1;
+    char row[ 200 ];
+    if( !listRowText_( hwndDlg, kCtlSessList, sel, row, sizeof( row ) ) )
+        return -1;
+    int i = 0;
+    while( row[i] >= '0' && row[i] <= '9' )
+        ++i;
+    if( i == 0 )
+        return -1;
+    row[i] = '\0';
+    const int which = (int) atol( row ) - 1;
+    if( which < 0 || which >= pmSessionsCount() )
+        return -1;
+    return which;
+}
+
+static void sessSay_( HWND hwndDlg, int code, const char *didText )
+{
+    const char *why = "";
+    switch( code )
+    {
+    case pmSessBusy:    why = "Finish the current reply first."; break;
+    case pmSessNoRow:   why = "Pick a row first.";               break;
+    case pmSessNoTitle: why = "Write a title first.";            break;
+    case pmSessFull:    why = "Sixteen sessions is what this keeps."; break;
+    default:            why = didText;                           break;
+    }
+    WinSetDlgItemText( hwndDlg, kCtlSessStatus, (PSZ) why );
+}
+
+MRESULT EXPENTRY pmSessionsDlgProc( HWND hwnd, ULONG msg,
+                                    MPARAM mp1, MPARAM mp2 )
+{
+    switch( msg )
+    {
+    case WM_INITDLG:
+        sessFill_( hwnd );
+        WinSetDlgItemText( hwnd, kCtlSessStatus, (PSZ)
+            "New starts a conversation and moves you into it." );
+        gDlgShown = 1;          // on screen: the wrapper's proof
+        return 0;
+
+    case WM_COMMAND:
+        switch( SHORT1FROMMP( mp1 ) )
+        {
+        case kCtlSessNew:
+            {
+            char t[ 160 ];
+            t[ 0 ] = '\0';
+            WinQueryDlgItemText( hwnd, kCtlSessTitle,
+                                 (LONG) sizeof( t ), (PSZ) t );
+            sessSay_( hwnd, pmSessionsNew( t ),
+                      "New session, and you are in it." );
+            sessFill_( hwnd );
+            return 0;
+            }
+
+        case kCtlSessRename:
+            {
+            const int which = sessWhich_( hwnd );
+            if( which < 0 )
+                {
+                sessSay_( hwnd, pmSessNoRow, "" );
+                return 0;
+                }
+            char t[ 160 ];
+            t[ 0 ] = '\0';
+            WinQueryDlgItemText( hwnd, kCtlSessTitle,
+                                 (LONG) sizeof( t ), (PSZ) t );
+            sessSay_( hwnd, pmSessionsRename( which, t ), "Renamed." );
+            sessFill_( hwnd );
+            return 0;
+            }
+
+        case kCtlSessDelete:
+            {
+            const int which = sessWhich_( hwnd );
+            if( which < 0 )
+                {
+                sessSay_( hwnd, pmSessNoRow, "" );
+                return 0;
+                }
+            sessSay_( hwnd, pmSessionsDelete( which ), "Deleted." );
+            sessFill_( hwnd );
+            return 0;
+            }
+
+        case DID_OK:
+            {
+            const int which = sessWhich_( hwnd );
+            if( which < 0 )
+                {
+                sessSay_( hwnd, pmSessNoRow, "" );
+                return 0;
+                }
+            const int code = pmSessionsSwitch( which );
+            if( code != pmSessOK )
+                {
+                // The switch refused: the box stays open, the user
+                // tries again or cancels -- closing here would say
+                // "switched" when nothing moved.
+                sessSay_( hwnd, code, "" );
+                return 0;
+                }
+            WinDismissDlg( hwnd, TRUE );
+            return 0;
+            }
+
+        case DID_CANCEL:
+            WinDismissDlg( hwnd, FALSE );
+            return 0;
+        }
+        break;
+
+    case WM_CLOSE:
+        WinDismissDlg( hwnd, FALSE );
+        return 0;
+    }
+    return WinDefDlgProc( hwnd, msg, mp1, mp2 );
+}
+
+static int pmSessionsDialog( void )
+{
+    pmNoteDialog( +1 );
+    gDlgShown = 0;
+    WinDlgBox( HWND_DESKTOP, pmFrameWindow(), pmSessionsDlgProc,
+               0, kDlgSessions, NULL );
+    const int shown = gDlgShown;
+    pmNoteDialog( -1 );
+    return shown;
+}
+
 /* Every dialog the front has a native twin for is in the table now; a
    console build never installs the kit at all and draws its tvision
    dialogs, which stay the reference implementations.
@@ -1082,6 +1257,7 @@ static const PmDialogs kPmDialogs =
     pmPromptsDialog,
     pmProvidersDialog,
     pmUndoDialog,
+    pmSessionsDialog,
     pmStatusKit,
     pmKeysToPageKit
     };

@@ -1027,6 +1027,7 @@ static void pmTakeCommand( int id )
         {
         { 1101, 0x23, "Alt-H help"      },
         { 1102, 0x16, "Alt-U undo"      },
+        { 1108, 0x31, "Alt-N sessions"  },
         { 1103, 0x19, "Alt-P providers" },
         { 1104, 0x17, "Alt-I settings"  },
         { 1107, 0x13, "Alt-R prompts"   },
