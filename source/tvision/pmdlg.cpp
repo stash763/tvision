@@ -1247,6 +1247,7 @@ static int pmSessionsDialog( void )
    keysToPage is the keyboard's traffic light for tvision modals. */
 extern "C" void pmStatusKit( const char *text );
 extern "C" void pmKeysToPageKit( int on );
+extern "C" void pmSessionsMenuChangedKit( void );
 
 static const PmDialogs kPmDialogs =
     {
@@ -1259,7 +1260,8 @@ static const PmDialogs kPmDialogs =
     pmUndoDialog,
     pmSessionsDialog,
     pmStatusKit,
-    pmKeysToPageKit
+    pmKeysToPageKit,
+    pmSessionsMenuChangedKit
     };
 
 void pmDialogsInstall( void )

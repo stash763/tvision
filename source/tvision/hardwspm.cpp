@@ -420,6 +420,7 @@ void pmToggleThinking( void );
 int  pmKitPromptLines( void );
 int  pmKitWindowAttr( void );
 void pmKitStatusRefresh( void );
+void pmMenuSessionChosen( unsigned index );   // sessions list rows, below
 }
 static Boolean gAvioOk   = False;
 static Boolean gPmUp    = False; // window + queue exist; drawing is legal
@@ -999,6 +1000,7 @@ HWND pmFrameWindow( void )
    that arrive mid-dialog wait for the count to fall back to zero. */
 /* Forward: defined with the kit entries further down this file. */
 extern "C" void pmGiveEntryFocus( void );
+extern "C" void pmSessionsMenuChangedKit( void );
 
 void pmNoteDialog( int delta )
 {
@@ -2355,6 +2357,19 @@ static MRESULT EXPENTRY pmGroupProc( HWND hwnd, ULONG msg,
                 gPollBeat = 8, pmPromptPoll();
             return 0;
             }
+        /* The Sessions submenu's list rows: not a key injection --
+           the payload is an index, and the app's own switch verb is
+           exactly what the row means.  This runs on the window
+           procedure's stack, the shape pmPromptSubmit has always had.
+           The range is the resource's contract (1140..1155, sixteen
+           seats, the store's cap); every other id goes on to the
+           key-injection table unchanged. */
+        const ULONG mid = (ULONG) SHORT1FROMMP( mp1 );
+        if( mid >= 1140 && mid < 1156 )
+            {
+            pmMenuSessionChosen( mid - 1140 );
+            return 0;
+            }
         pmTakeCommand( (int) SHORT1FROMMP( mp1 ) );
         return 0;
 
@@ -3419,6 +3434,14 @@ static void pmOpenWindow()
     gPmUp = True;
     pmLog( "shown" );
 
+    /* The Sessions submenu the resource built carries Manage and a
+       divider; the rows under it belong to the store.  This is the
+       initial fill -- and its outcome, either "menu rows: shown=N"
+       or the quiet "no submenu handle", lands in this same log, so
+       the menu's health is readable from the birth lines without
+       anyone at the display. */
+    pmSessionsMenuChangedKit();
+
     // The alarm thread: born last, because it posts to the window and must
     // never meet one that is not there yet.  It is the timeout machinery of
     // the wait, and nothing else; losing it (a thread the runtime could not
@@ -3516,6 +3539,153 @@ extern "C" void pmKeysToPageKit( int on )
             --gKeysOnPage;
         if( gKeysOnPage == 0 && gEntry != 0 && gGroup != 0 )
             WinSetFocus( gGroup, gEntry );
+        }
+}
+
+/* ------------------------------------------------------------------
+   The Sessions menu's rows.
+
+   The resource (atuipm.rc) carries the submenu -- "Sessio~n~s" id
+   1300, Manage 1108, a divider -- and stops there: what lives under
+   the divider is whatever the store holds, and resources cannot know
+   that.  This Watcom ships no FCM record API at all (measured: no
+   FCM_FINDMENU, no FCMENURECORD in C:\WATCOM\H\OS2\PMWIN.H), so the
+   rows ride the PM 1.x item messages, which Warp kept: MM_INSERTITEM
+   to make a row, MM_SETITEMTEXT to retitle it, MM_DELETEITEM to take
+   it away, MM_SETITEMATTR for the check mark and the refusal, and
+   MM_ISITEMVALID as the question that tells the loop what is already
+   there.
+
+   Two things this takes on faith and probe_pmmenu was written to
+   settle at the box's display before the feature shipped: which
+   handle the submenu answers under (the candidates below, each tried
+   until one answers MM_QUERYITEMCOUNT for an id it owns), and the MP
+   shape of MM_INSERTITEM (the three the probe tried, in the probe's
+   order).  Everything else -- text round-trips, check, disable --
+   the probe reads back on the live menu.
+
+   None of it is load-bearing for the app: if no candidate answers,
+   the sync quietly refuses and the menu stays Manage-plus-divider,
+   which is still a door to the dialog that lists everything. */
+
+/* The submenu's rows' ids, matching atuipm.rc's contract: 16 seats,
+   the store's cap. */
+#define PM_SESS_MENU_BASE 1140
+#define PM_SESS_MENU_MAX  16
+
+static HWND   gSessMenu    = 0;   /* resolved once, kept while it answers */
+static int    gSessMenuLog = 0;   /* the birth line is logged once */
+
+/* Does this handle answer as a menu that holds `id`? */
+static Boolean sessMenuAnswers_( HWND h, ULONG id )
+{
+    if( h == 0 )
+        return False;
+    /* MM_ISITEMVALID for an id the submenu owns from the moment the
+       resource loads -- Manage, which atuipm.rc puts there -- is the
+       cheapest question whose yes means "this is a live menu". */
+    return WinSendMsg( h, MM_ISITEMVALID, MPFROM2SHORT( id, TRUE ),
+                       MPFROMLONG( FALSE ) ) ? True : False;
+}
+
+static HWND sessMenu_( void )
+{
+    if( gSessMenu != 0 && sessMenuAnswers_( gSessMenu, 1108 ) )
+        return gSessMenu;
+    gSessMenu = 0;
+    if( gFrame == 0 )
+        return 0;
+    const HWND mb = WinWindowFromID( gFrame, FID_MENU );
+    if( mb == 0 )
+        return 0;
+    HWND cand[ 4 ];
+    cand[ 0 ] = WinWindowFromID( mb, 1300 );
+    cand[ 1 ] = WinWindowFromID( gFrame, 1300 );
+    cand[ 2 ] = (HWND) (ULONG) WinSendMsg( mb, WM_USER + 0x206,
+                              MPFROMLONG( 1300 ), MPVOID );
+    cand[ 3 ] = (HWND) (ULONG) WinSendMsg( mb, WM_USER + 0x207,
+                              MPFROMLONG( 1300 ), MPVOID );
+    for( int i = 0; i < 4; ++i )
+        {
+        if( sessMenuAnswers_( cand[ i ], 1108 ) )
+            {
+            gSessMenu = cand[ i ];
+            return gSessMenu;
+            }
+        }
+    return 0;
+}
+
+/* One insert, in each MP shape the probe tried; validity is checked
+   between the attempts, because a shape that worked has already made
+   the row and a second attempt on an existing id is not a question
+   anyone wants answered. */
+static Boolean sessRowInsert_( HWND m, ULONG id )
+{
+    MENUITEM mi;
+    memset( &mi, 0, sizeof mi );
+    mi.iPosition = MIT_LAST;
+    mi.afStyle   = MIS_TEXT;
+    mi.id        = (USHORT) id;
+    for( int form = 0; form < 3; ++form )
+        {
+        if( WinSendMsg( m, MM_ISITEMVALID, MPFROM2SHORT( id, TRUE ),
+                        MPFROMLONG( FALSE ) ) )
+            return True;
+        if( form == 0 )
+            WinSendMsg( m, MM_INSERTITEM, MPFROMP( &mi ), MPVOID );
+        else if( form == 1 )
+            WinSendMsg( m, MM_INSERTITEM, MPFROMLONG( id ), MPFROMP( &mi ) );
+        else
+            WinSendMsg( m, MM_INSERTITEM,
+                        MPFROM2SHORT( MIT_LAST, (USHORT) id ),
+                        MPFROMP( &mi ) );
+        }
+    return WinSendMsg( m, MM_ISITEMVALID, MPFROM2SHORT( id, TRUE ),
+                       MPFROMLONG( FALSE ) ) ? True : False;
+}
+
+extern "C" void pmSessionsMenuChangedKit( void )
+{
+    HWND m = sessMenu_();
+    if( m == 0 )
+        {
+        if( gLog != 0 && gSessMenuLog < 2 )
+            {
+            ++gSessMenuLog;
+            fprintf( gLog, "menu rows: no submenu handle\n" ),
+                fflush( gLog );
+            }
+        return;
+        }
+
+    const int count  = pmSessionsCount();
+    const int active = pmSessionsActive();
+    int shown = 0;
+    for( int i = 0; i < PM_SESS_MENU_MAX; ++i )
+        {
+        const ULONG id = PM_SESS_MENU_BASE + i;
+        const Boolean valid =
+            WinSendMsg( m, MM_ISITEMVALID, MPFROM2SHORT( id, TRUE ),
+                        MPFROMLONG( FALSE ) ) ? True : False;
+        if( i < count )
+            {
+            if( !valid && !sessRowInsert_( m, id ) )
+                break;      /* no room in this menu for the rest */
+            WinSetMenuItemText( m, id, (PCSZ) pmSessionsMenuLabel( i ) );
+            WinEnableMenuItem( m, id, TRUE );
+            WinCheckMenuItem( m, id, i == active );
+            ++shown;
+            }
+        else if( valid )
+            WinSendMsg( m, MM_DELETEITEM, MPFROMLONG( id ), MPVOID );
+        }
+
+    if( gLog != 0 && gSessMenuLog < 8 )
+        {
+        ++gSessMenuLog;
+        fprintf( gLog, "menu rows: shown=%d active=%d\n", shown, active ),
+            fflush( gLog );
         }
 }
 
